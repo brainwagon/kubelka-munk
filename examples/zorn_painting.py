@@ -52,7 +52,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
-from scipy.ndimage import gaussian_filter, sobel, zoom
+from scipy.ndimage import distance_transform_edt, gaussian_filter, sobel, zoom
 from scipy.spatial import cKDTree
 
 from kubelka_munk import srgb_to_xyz, xyz_to_lab
@@ -146,6 +146,11 @@ VIDEO_HOLD_SECONDS = 1.5
 # much the picture visibly changes per second.
 FRAME_WEIGHT = 0.3
 
+# How much looser the background is painted than the subject, when the two are separated.
+# Keeping the background broader is how a painter directs attention: detail is expensive,
+# and spending it evenly over a picture is part of what makes one read as a photograph.
+BACKGROUND_LOOSER_BY = 0.25
+
 # The one dial for how tightly the painting follows the photograph. Half way reproduces
 # the settings these were tuned to by hand; see Style below for what it moves.
 DEFAULT_TIGHTNESS = 0.5
@@ -159,12 +164,26 @@ def paint(
     jitter: float | None = None,
     recorder: "Recorder | None" = None,
     fallback_angle: float = FALLBACK_ANGLE,
-    style: Style | None = None,
+    style: "Style | None" = None,
+    foreground: np.ndarray | None = None,
+    background_style: "Style | None" = None,
 ) -> Image.Image:
-    """Work from the coarsest brush to the finest, refining what the last one missed."""
+    """Work from the coarsest brush to the finest, refining what the last one missed.
+
+    Given a ``foreground`` mask the picture is painted in two passes rather than one: the
+    whole background first, then the subject over the top. That is the order a painter
+    works in, and it buys two things a single pass cannot. The background can be painted
+    more broadly than the subject, which is how attention gets directed. And the
+    subject's strokes are confined to its own silhouette, so the edge stays where it
+    belongs instead of being chewed by strokes that began inside the face and ran out
+    into the sky.
+
+    The background's strokes are deliberately *not* confined. They run on past the
+    silhouette and are simply covered up, which is both simpler and closer to how the
+    thing is actually done.
+    """
     style = Style.from_tightness(DEFAULT_TIGHTNESS) if style is None else style
-    radii = style.brushes(BRUSH_RADII if radii is None else radii)
-    jitter = style.jitter if jitter is None else jitter
+    background_style = style if background_style is None else background_style
     height, width, _ = image.shape
     generator = np.random.default_rng(seed)
 
@@ -173,6 +192,14 @@ def paint(
     # One hatching field for the whole painting, so every layer agrees about which way to
     # lay paint where the picture does not say.
     hatching = _hatching_field((height, width), fallback_angle, generator)
+
+    if foreground is None:
+        passes = [("picture", None, style)]
+    else:
+        passes = [
+            ("background", 1.0 - foreground, background_style),
+            ("subject", foreground, style),
+        ]
 
     # Start from the picture's average colour, so that anywhere the brushes never visit
     # still reads as part of the painting rather than as a hole.
@@ -183,43 +210,93 @@ def paint(
     # what paint does.
     relief = Image.new("L", (width, height), 128)
 
-    # The layers have to be planned before any are painted, so the film's running time
-    # can be shared out between them.
-    planned = []
+    # Every layer of every pass has to be planned before any of it is painted, so that
+    # the film's running time can be shared out between them.
+    plans = []
     scratch = canvas.copy()
-    for radius in radii:
-        reference = gaussian_filter(
-            image, sigma=(BLUR_PER_RADIUS * radius, BLUR_PER_RADIUS * radius, 0)
+    for label, region, pass_style in passes:
+        subject = image if region is None else _isolate(image, region)
+        region_mask = (
+            None
+            if region is None
+            else Image.fromarray((region * 255).astype(np.uint8), "L")
         )
-        strokes = _plan_layer(np.asarray(scratch) / 255.0, reference, radius, style)
-        generator.shuffle(strokes)
-        planned.append((radius, reference, strokes))
-        # A rough stand-in for what the layer will do, good enough to plan the next one.
-        scratch = _preview_layer(scratch, reference, strokes, radius)
+        for radius in pass_style.brushes(radii or BRUSH_RADII):
+            reference = gaussian_filter(
+                subject, sigma=(BLUR_PER_RADIUS * radius, BLUR_PER_RADIUS * radius, 0)
+            )
+            strokes = _plan_layer(
+                np.asarray(scratch) / 255.0, reference, radius, pass_style, region
+            )
+            generator.shuffle(strokes)
+            plans.append((label, region_mask, pass_style, radius, reference, strokes))
+            # A rough stand-in for what the layer will do, good enough to plan the next.
+            scratch = _preview_layer(scratch, reference, strokes, radius, region_mask)
 
     budget = (
         _plan_frames(
-            [len(strokes) for _, _, strokes in planned],
+            [len(strokes) for *_, strokes in plans],
             round((VIDEO_SECONDS - VIDEO_HOLD_SECONDS) * VIDEO_FPS),
         )
         if recorder
-        else [0] * len(planned)
+        else [0] * len(plans)
     )
 
     if recorder:
         recorder.frame(canvas, relief)
 
-    for (radius, reference, strokes), frames in zip(planned, budget):
+    painted, painted_relief, mask, current = canvas, relief, None, None
+    for (label, region_mask, pass_style, radius, reference, strokes), frames in zip(
+        plans, budget
+    ):
+        if label != current:
+            _stencil(canvas, relief, painted, painted_relief, mask)
+            mask = region_mask
+            # A masked pass is painted on its own copy and stencilled on afterwards, so
+            # that its strokes cannot spill out past the silhouette.
+            painted = canvas.copy() if mask is not None else canvas
+            painted_relief = relief.copy() if mask is not None else relief
+            current = label
+
+        def capture(surface=painted, surface_relief=painted_relief, stencil=mask):
+            """The painting as it would look if the pass in progress stopped here."""
+            if stencil is None:
+                recorder.frame(surface, surface_relief)
+            else:
+                preview, preview_relief = canvas.copy(), relief.copy()
+                preview.paste(surface, (0, 0), stencil)
+                preview_relief.paste(surface_relief, (0, 0), stencil)
+                recorder.frame(preview, preview_relief)
+
         _draw_layer(
-            canvas, relief, strokes, reference, radius, snap, generator, jitter,
-            hatching, style, recorder, frames,
+            painted,
+            painted_relief,
+            strokes,
+            reference,
+            radius,
+            snap,
+            generator,
+            pass_style.jitter if jitter is None else jitter,
+            hatching,
+            pass_style,
+            capture if recorder else None,
+            frames,
         )
-        print(f"    brush {radius:3d}px  {len(strokes):6d} strokes")
+        print(f"    {label:10s} brush {radius:3d}px  {len(strokes):6d} strokes")
+
+    _stencil(canvas, relief, painted, painted_relief, mask)
 
     if recorder:
         recorder.frame(canvas, relief, times=round(VIDEO_HOLD_SECONDS * VIDEO_FPS))
 
     return _apply_impasto(canvas, relief)
+
+
+def _stencil(canvas, relief, painted, painted_relief, mask) -> None:
+    """Lay a finished pass onto the painting, if it was painted on a copy of its own."""
+    if mask is not None:
+        canvas.paste(painted, (0, 0), mask)
+        relief.paste(painted_relief, (0, 0), mask)
 
 
 @dataclass(frozen=True)
@@ -274,6 +351,36 @@ class Style:
             f"{self.repaint_threshold:.1f}, stroke <= {self.maximum_stroke}, "
             f"tolerance {self.stroke_tolerance:.0f}, jitter {self.jitter:.1f}"
         )
+
+
+def foreground_mask(image: Image.Image, model: str = "u2net") -> np.ndarray:
+    """Separate the subject from its background, as a soft mask in [0, 1].
+
+    rembg is imported here rather than at the top of the file because it pulls in a
+    neural network runtime and takes a noticeable moment to load, which nobody painting
+    a picture in a single pass should have to wait for.
+    """
+    from rembg import new_session, remove
+
+    cut_out = remove(image, session=new_session(model))
+    return np.asarray(cut_out)[..., 3].astype(float) / 255.0
+
+
+def _isolate(image: np.ndarray, region: np.ndarray) -> np.ndarray:
+    """Flood everything outside the region with the nearest colour inside it.
+
+    Every pass blurs the photograph to match its brush, and a blur does not respect a
+    silhouette. Blurred for the background pass, the subject's face bleeds outward, and
+    the background would be painted in skin tones for a brush-width all around him.
+    Replacing the far side with its nearest neighbour first leaves the blur nothing to
+    drag across the boundary.
+    """
+    outside = region < 0.5
+    if not outside.any():
+        return image
+
+    _, nearest = distance_transform_edt(outside, return_indices=True)
+    return image[nearest[0], nearest[1]]
 
 
 class Recorder:
@@ -422,7 +529,11 @@ def _orientation_field(
 
 
 def _plan_layer(
-    canvas: np.ndarray, reference: np.ndarray, radius: int, style: Style
+    canvas: np.ndarray,
+    reference: np.ndarray,
+    radius: int,
+    style: Style,
+    region: np.ndarray | None = None,
 ) -> list[tuple[int, int]]:
     """Where this brush is needed: the worst pixel of every cell that is not good enough.
 
@@ -432,6 +543,12 @@ def _plan_layer(
     difference = np.linalg.norm(
         xyz_to_lab(srgb_to_xyz(canvas)) - xyz_to_lab(srgb_to_xyz(reference)), axis=-1
     )
+
+    if region is not None:
+        # Outside this pass's region there is nothing to answer for, so a cell straddling
+        # the boundary is judged only on the part that belongs to it, and the worst pixel
+        # found within a cell is necessarily one of its own.
+        difference = difference * region
 
     height, width = difference.shape
     cells_down = -(-height // radius)
@@ -457,7 +574,7 @@ def _plan_layer(
     return list(zip(columns[inside].tolist(), rows[inside].tolist()))
 
 
-def _preview_layer(canvas, reference, strokes, radius):
+def _preview_layer(canvas, reference, strokes, radius, region_mask=None):
     """Roughly what a layer will leave behind, for planning the next one.
 
     Painting a layer twice would double the running time, so this stands in: the strokes
@@ -472,12 +589,16 @@ def _preview_layer(canvas, reference, strokes, radius):
             [x - radius, y - radius, x + radius, y + radius],
             fill=tuple(colours[y, x].tolist()),
         )
+    if region_mask is not None:
+        stencilled = canvas.copy()
+        stencilled.paste(preview, (0, 0), region_mask)
+        return stencilled
     return preview
 
 
 def _draw_layer(
     canvas, height, strokes, reference, radius, snap, generator, jitter, hatching,
-    style, recorder=None, frames=0,
+    style, capture=None, frames=0,
 ) -> None:
     """Trace and paint every stroke of one layer, and record how thick the paint got."""
     brush = ImageDraw.Draw(canvas)
@@ -503,7 +624,7 @@ def _draw_layer(
     thickness = generator.integers(90, 210, size=len(strokes))
     widths = generator.uniform(*WIDTH_VARIATION, size=len(strokes))
 
-    capture_every = max(1, len(strokes) // frames) if recorder and frames else 0
+    capture_every = max(1, len(strokes) // frames) if capture and frames else 0
 
     for index, (x, y) in enumerate(strokes):
         points = _trace_stroke(
@@ -520,7 +641,7 @@ def _draw_layer(
             brush.ellipse(box, fill=tuple(colours[index, 0].tolist()))
             relief.ellipse(box, fill=paint_height)
             if capture_every and index % capture_every == 0:
-                recorder.frame(canvas, height)
+                capture()
             continue
 
         for bristle, outline in enumerate(tracks):
@@ -528,7 +649,7 @@ def _draw_layer(
             relief.polygon(outline, fill=paint_height)
 
         if capture_every and index % capture_every == 0:
-            recorder.frame(canvas, height)
+            capture()
 
 
 def _apply_impasto(painting: Image.Image, height: Image.Image) -> Image.Image:
@@ -726,6 +847,8 @@ def main(
     video: str | None = None,
     fallback_angle: float = FALLBACK_ANGLE,
     tightness: float = DEFAULT_TIGHTNESS,
+    separate: bool = False,
+    background_tightness: float | None = None,
 ) -> None:
     source_path = Path(source)
     destination_path = (
@@ -747,6 +870,20 @@ def main(
 
     style = Style.from_tightness(tightness)
     print(f"  tightness {tightness:.2f}: {style.describe()}")
+
+    foreground, background_style = None, None
+    if separate:
+        foreground = foreground_mask(original)
+        looser = (
+            max(0.0, tightness - BACKGROUND_LOOSER_BY)
+            if background_tightness is None
+            else background_tightness
+        )
+        background_style = Style.from_tightness(looser)
+        print(
+            f"  subject covers {foreground.mean():.0%} of the picture; background "
+            f"painted at tightness {looser:.2f}"
+        )
 
     palette = build_palette()
     palette_colours, weights = build_chit_colours(palette)
@@ -772,6 +909,8 @@ def main(
         recorder=recorder,
         fallback_angle=fallback_angle,
         style=style,
+        foreground=foreground,
+        background_style=background_style,
     )
     painting.save(destination_path)
 
@@ -825,6 +964,19 @@ if __name__ == "__main__":
         help="override the colour jitter the tightness would choose (0 to disable)",
     )
     parser.add_argument(
+        "-s",
+        "--separate",
+        action="store_true",
+        help="cut the subject out with rembg and paint the background first, then the "
+        "subject over it, so the background can be looser and the silhouette stays clean",
+    )
+    parser.add_argument(
+        "--background-tightness",
+        type=float,
+        help=f"tightness for the background (default: {BACKGROUND_LOOSER_BY} looser than "
+        "the subject)",
+    )
+    parser.add_argument(
         "--fallback-angle",
         type=float,
         default=FALLBACK_ANGLE,
@@ -855,4 +1007,6 @@ if __name__ == "__main__":
         arguments.video,
         arguments.fallback_angle,
         arguments.tightness,
+        arguments.separate,
+        arguments.background_tightness,
     )

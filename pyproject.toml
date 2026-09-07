@@ -12,6 +12,9 @@ dependencies = ["numpy>=1.24", "scipy>=1.10"]
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+# The library itself needs only numpy and scipy. These are for the example programs:
+# Pillow to draw and save images, rembg to cut a subject out of its background.
+examples = ["Pillow>=10", "rembg>=2.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
