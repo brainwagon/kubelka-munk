@@ -16,8 +16,10 @@ for what the words mean.
 """
 
 from .colorimetry import (
+    decode_srgb,
     delta_e_1976,
     delta_e_2000,
+    encode_srgb,
     hex_to_srgb,
     lab_to_srgb,
     lab_to_xyz,
@@ -53,7 +55,9 @@ __all__ = [
     "absorption_over_scattering",
     "apply_saunderson",
     "as_spectrum",
+    "decode_srgb",
     "delta_e_1976",
+    "encode_srgb",
     "delta_e_2000",
     "hex_to_srgb",
     "lab_to_srgb",
