@@ -26,14 +26,30 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from kubelka_munk import Paint, Palette
+from kubelka_munk import Paint, Palette, reflectance_from_srgb
 
-# name, masstone, tinting strength -- approximations, as everywhere in this library.
+# Each paint is given two observations rather than one: its masstone, and its colour
+# when one part of it is mixed into nine parts titanium white. The tint is what separates
+# absorption from scattering, and it is the difference between a wheel that works and one
+# whose black end is a smear of near-identical browns.
+#
+# A masstone alone cannot do this. It fixes only the ratio K/S, and every paint sharing
+# that ratio -- from one that barely tints to one that annihilates everything it touches
+# -- has the identical masstone. The tint is the observation that tells them apart, and
+# it is something a painter can judge by eye far more reliably than a coefficient.
+#
+# These are estimates, not measurements. Replace them with your own paints' tints.
+TINT_FRACTION = 0.1
+
+# name, masstone, colour at one part in nine of white
 ZORN_HUES = [
-    ("Yellow Ochre", "#c8a02c", 2.0),
-    ("Vermilion", "#e34234", 2.5),
-    ("Ivory Black", "#23201e", 4.0),
+    ("Yellow Ochre", "#c8a02c", "#e5d7b0"),
+    ("Vermilion", "#e34234", "#f3c0b0"),
+    ("Ivory Black", "#23201e", "#9e9e9d"),
 ]
+
+# The white everything else is calibrated against, and the only paint still built from a
+# single colour -- there is nothing lighter to tint it with.
 TITANIUM_WHITE = ("Titanium White", "#fbfaf6", 10.0)
 
 # How pale the outermost ring gets. Titanium white scatters so strongly that going much
@@ -264,11 +280,25 @@ def write_svg(
         handle.write("\n".join(parts))
 
 
+def build_palette() -> Palette:
+    """The four Zorn paints: three calibrated from masstone and tint, plus the white."""
+    white = Paint.from_srgb(*TITANIUM_WHITE[:2], tinting_strength=TITANIUM_WHITE[2])
+
+    hues = [
+        Paint.from_measurements(
+            name,
+            masstone=reflectance_from_srgb(masstone),
+            tint=reflectance_from_srgb(tint),
+            white=white,
+            tint_fraction=TINT_FRACTION,
+        )
+        for name, masstone, tint in ZORN_HUES
+    ]
+    return Palette([*hues, white])
+
+
 def main(rounds: int = 2, tints: int = 4) -> None:
-    palette = Palette(
-        Paint.from_srgb(name, colour, tinting_strength=strength)
-        for name, colour, strength in [*ZORN_HUES, TITANIUM_WHITE]
-    )
+    palette = build_palette()
 
     hues = build_hues(len(ZORN_HUES), rounds)
     chits = add_tints(hues, tints)

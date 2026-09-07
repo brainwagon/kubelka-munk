@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from kubelka_munk import Paint, Spectrum
+from kubelka_munk import Paint, Spectrum, reflectance_from_srgb
 
 
 def test_a_paint_built_from_a_colour_shows_that_colour():
@@ -45,8 +45,16 @@ def test_negative_coefficients_are_refused():
 
 
 def test_a_paint_that_scatters_nothing_is_refused():
-    with pytest.raises(ValueError, match="invisible"):
+    with pytest.raises(ValueError, match="must be positive at every wavelength"):
         Paint("void", absorption=np.ones(36), scattering=np.zeros(36))
+
+
+def test_a_paint_that_scatters_nothing_in_one_band_is_refused():
+    """A single dead band used to slip through and produce NaN downstream, not an error."""
+    scattering = np.ones(36)
+    scattering[17] = 0.0
+    with pytest.raises(ValueError, match="must be positive at every wavelength"):
+        Paint("nearly fine", absorption=np.ones(36), scattering=scattering)
 
 
 def test_wrongly_sized_coefficients_are_refused():
@@ -98,6 +106,48 @@ class TestCalibrationFromMeasurements:
                 Paint.from_measurements(
                     "x", spectrum, spectrum, white, tint_fraction=fraction
                 )
+
+    def test_calibration_survives_a_tint_that_is_slightly_too_dark_somewhere(self):
+        """Real measurements are noisy, and near-white bands are where it shows.
+
+        Where a paint already reflects almost everything, adding white cannot lighten it
+        further, and a hair of noise can make the tint read very slightly darker than the
+        masstone. That is physically impossible, so those bands carry no information
+        about scattering. They must be filled in rather than solved -- this case used to
+        divide by zero and hand back a Paint full of NaN.
+        """
+        white = Paint.from_srgb("White", "#fbfaf6", tinting_strength=10.0)
+
+        calibrated = Paint.from_measurements(
+            "Vermilion",
+            masstone=reflectance_from_srgb("#e34234"),
+            tint=reflectance_from_srgb("#f3c0b0"),
+            white=white,
+            tint_fraction=0.1,
+        )
+
+        assert np.all(np.isfinite(calibrated.absorption))
+        assert np.all(calibrated.scattering > 0.0)
+        assert calibrated.hex_colour == "#e34234"
+
+    def test_no_paint_scatters_harder_than_the_white_it_was_calibrated_against(self):
+        """Titanium dioxide is the strongest scatterer in ordinary use.
+
+        Bands only just past the informativeness threshold otherwise solve to enormous
+        scattering -- values in the thousands against the white's 10 -- which would then
+        swamp the scattering of every mixture the paint appeared in.
+        """
+        white = Paint.from_srgb("White", "#fbfaf6", tinting_strength=10.0)
+
+        calibrated = Paint.from_measurements(
+            "Vermilion",
+            masstone=reflectance_from_srgb("#e34234"),
+            tint=reflectance_from_srgb("#f3c0b0"),
+            white=white,
+            tint_fraction=0.1,
+        )
+
+        assert np.all(calibrated.scattering <= white.scattering + 1e-9)
 
     def test_a_tint_identical_to_the_masstone_carries_no_information(self):
         """If white does not change the colour, nothing can be learned about scattering."""

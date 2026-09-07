@@ -57,8 +57,12 @@ class Paint:
                 )
             object.__setattr__(self, label, array)
 
-        if np.all(self.scattering == 0.0):
-            raise ValueError(f"{self.name}: a paint that scatters no light is invisible")
+        if np.any(self.scattering <= 0.0):
+            raise ValueError(
+                f"{self.name}: scattering must be positive at every wavelength -- a "
+                f"band that scatters no light reflects none either, and the ratio K/S "
+                f"is undefined there"
+            )
 
     @classmethod
     def from_srgb(
@@ -135,8 +139,8 @@ class Paint:
             tint_fraction: the proportion of *this* paint in the tint, in (0, 1).
                 A 1:9 paint-to-white tint means 0.1.
 
-        Scattering is recovered per wavelength and clamped at zero, since measurement
-        noise can otherwise drive it slightly negative, which is unphysical.
+        Scattering is recovered per wavelength. Some bands may carry no usable
+        information -- see below -- and are filled in from the bands that do.
         """
         if not 0.0 < tint_fraction < 1.0:
             raise ValueError(
@@ -166,19 +170,35 @@ class Paint:
         )
         denominator = tint_fraction * (masstone_ratio - tint_ratio)
 
-        scattering = np.divide(
-            numerator,
-            denominator,
-            out=np.zeros_like(numerator),
-            where=np.abs(denominator) > 1e-12,
-        )
-        scattering = np.maximum(scattering, 0.0)
-        if np.all(scattering == 0.0):
+        # A band tells us something only if adding white measurably lightened it. Where
+        # the paint already reflects almost everything, white changes nothing and the
+        # denominator collapses; measurement noise can even send it slightly negative,
+        # which would mean white had darkened the paint. Those bands are not solved.
+        is_informative = (denominator > 1e-9) & (numerator > 0.0)
+        if not np.any(is_informative):
             raise ValueError(
                 f"{name}: could not separate absorption from scattering -- the tint is "
                 f"indistinguishable from the masstone, so the measurements carry no "
                 f"information about scattering"
             )
+
+        scattering = np.divide(
+            numerator, denominator, out=np.ones_like(numerator), where=is_informative
+        )
+
+        # Titanium dioxide is the most strongly scattering pigment in ordinary use, so
+        # no colorant calibrated against a white should come out scattering harder than
+        # that white does. Bands only just above the informativeness threshold can
+        # otherwise solve to enormous values, which would then dominate every mixture.
+        scattering = np.minimum(scattering, white.scattering)
+
+        # Where the data was silent, assume the pigment scatters as it does elsewhere.
+        # This is safe for the paint's own colour, which depends only on the ratio K/S
+        # and is fixed by the masstone; it affects only how the paint behaves in a
+        # mixture, and only in bands the calibration could not speak to.
+        scattering = np.where(
+            is_informative, scattering, np.median(scattering[is_informative])
+        )
 
         return cls(
             name=name,
