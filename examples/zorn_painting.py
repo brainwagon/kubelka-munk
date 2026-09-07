@@ -106,8 +106,19 @@ ENERGY_FLOOR = 0.5
 # towards the end as the brush lifts. This is most of what separates a brush from a marker.
 BRISTLES = 3
 BRISTLE_SPREAD = 0.8
-TAPER_TO = 0.35
 WIDTH_VARIATION = (0.75, 1.15)
+
+# The mark narrows to nearly nothing as the brush lifts, rather than stopping at a third
+# of its width and being cut off square.
+TAPER_TO = 0.12
+
+# Bristles do not all land and lift together, so each track starts and finishes somewhere
+# within this fraction of either end of the path. Without it every bristle stops on the
+# same line and the stroke ends look guillotined however they are shaped.
+BRISTLE_STAGGER = 0.25
+
+# Points around the rounded end where the brush first touches down.
+CAP_POINTS = 6
 
 # Paint stands off the canvas and its ridges catch the light. Strokes accumulate into a
 # height field which is then lit from the upper left.
@@ -411,7 +422,7 @@ def _draw_layer(
             x, y, radius, field, reference_lab, loaded[index]
         )
         width = radius * widths[index]
-        tracks = _bristle_tracks(points, width)
+        tracks = _bristle_tracks(points, width, generator)
         paint_height = int(thickness[index])
 
         if not tracks:
@@ -501,15 +512,35 @@ def _trace_stroke(
     return points
 
 
+def _round_cap(
+    centre: np.ndarray, direction: np.ndarray, normal: np.ndarray, half_width: float
+) -> np.ndarray:
+    """A half circle closing the end where the brush touched down.
+
+    Swept in the local frame of the stroke: from one side, back around behind the
+    starting point, to the other side. Appending it to the outline turns what would
+    otherwise close as a straight line across the width into a rounded end.
+    """
+    angles = np.linspace(-np.pi / 2, np.pi / 2, CAP_POINTS)
+    return centre + half_width * (
+        np.cos(angles)[:, np.newaxis] * -direction
+        + np.sin(angles)[:, np.newaxis] * normal
+    )
+
+
 def _bristle_tracks(
-    points: list[tuple[float, float]], radius: float
+    points: list[tuple[float, float]], radius: float, generator
 ) -> list[list[tuple[float, float]]]:
     """Turn a path into a few tapered parallel ribbons, one per bristle.
 
-    A constant-width band with a round cap is the shape a mouse makes, not a brush. Real
-    bristles leave separate tracks with gaps between them, and the mark narrows as the
-    brush lifts, so each track is built as a polygon whose width falls off along its
-    length.
+    A constant-width band is the shape a mouse makes, not a brush. Three things separate
+    the two, and all of them are about the ends:
+
+    The brush lands, so the start is rounded rather than cut square. The brush lifts, so
+    the mark narrows to almost nothing rather than stopping at full width. And the
+    bristles are not all the same length, so they begin and end at slightly different
+    points along the path instead of together on one line -- which is what stops a stroke
+    looking as though it had been trimmed with scissors.
     """
     path = np.array(points, dtype=float)
     if len(path) < 2:
@@ -524,20 +555,39 @@ def _bristle_tracks(
     directions /= np.maximum(lengths, 1e-9)
     normals = np.stack([-directions[:, 1], directions[:, 0]], axis=1)
 
-    along = np.linspace(0.0, 1.0, len(path))
-    taper = 1.0 - (1.0 - TAPER_TO) * along
-
     offsets = (
         np.linspace(-1.0, 1.0, BRISTLES) if BRISTLES > 1 else np.zeros(1)
     ) * BRISTLE_SPREAD
-    half_width = (radius / BRISTLES) * 1.15 * taper
+    last_index = len(path) - 1
 
     tracks = []
     for offset in offsets:
-        centre = path + normals * (offset * radius)
-        left = centre + normals * half_width[:, np.newaxis]
-        right = centre - normals * half_width[:, np.newaxis]
-        outline = np.vstack([left, right[::-1]])
+        first = int(round(generator.uniform(0.0, BRISTLE_STAGGER) * last_index))
+        final = int(round(generator.uniform(1.0 - BRISTLE_STAGGER, 1.0) * last_index))
+        if final - first < 1:
+            first, final = 0, last_index
+
+        span = slice(first, final + 1)
+        centre = path[span] + normals[span] * (
+            offset * radius + generator.normal(0.0, 0.08 * radius)
+        )
+        edge = normals[span]
+
+        along = np.linspace(0.0, 1.0, len(centre))
+        taper = 1.0 - (1.0 - TAPER_TO) * along
+        # Tapering and staggering between them remove about two fifths of the area a
+        # square-ended track would cover, so the tracks are widened to put it back.
+        # Without this the strokes are prettier and the painting is threadbare, with the
+        # underpainting showing through everywhere.
+        half_width = (
+            (radius / BRISTLES) * 1.6 * generator.uniform(0.8, 1.2) * taper
+        )
+
+        left = centre + edge * half_width[:, np.newaxis]
+        right = centre - edge * half_width[:, np.newaxis]
+        cap = _round_cap(centre[0], directions[span][0], edge[0], half_width[0])
+
+        outline = np.vstack([left, right[::-1], cap])
         tracks.append([(float(px), float(py)) for px, py in outline])
     return tracks
 
