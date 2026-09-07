@@ -45,6 +45,7 @@ Run it with:  python examples/zorn_painting.py <image> [output] [-m N] [--seed N
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import shutil
 import subprocess
 from pathlib import Path
@@ -65,14 +66,8 @@ BRUSH_RADII = [32, 16, 8, 4]
 # How blurred the reference is for a given brush, as a multiple of its radius.
 BLUR_PER_RADIUS = 0.5
 
-# A cell is repainted when its average colour difference exceeds this. Raising it leaves
-# more of the coarse underpainting showing; lowering it drives the picture towards the
-# photograph and away from looking painted.
-REPAINT_THRESHOLD = 8.0
-
-# Stroke lengths, in brush radii.
+# Stroke lengths, in brush radii. The maximum is set by the style, below.
 MINIMUM_STROKE = 4
-MAXIMUM_STROKE = 12
 
 # How readily a stroke changes direction: 1 follows the orientation field exactly, 0 never
 # turns at all. This is Hertzmann's curvature filter, kept low because a stroke that can
@@ -151,15 +146,9 @@ VIDEO_HOLD_SECONDS = 1.5
 # much the picture visibly changes per second.
 FRAME_WEIGHT = 0.3
 
-# How far a stroke's colour may wander from the palette mixture it started with before it
-# is cut short, in units of colour difference.
-STROKE_TOLERANCE = 25.0
-
-# How much each stroke's colour is nudged before it is snapped to a mixture, in units of
-# colour difference. A real brush is never loaded twice with quite the same colour, and a
-# passage painted in one flat tint looks printed rather than painted. Setting this to
-# zero turns the jitter off.
-COLOUR_JITTER = 5.0
+# The one dial for how tightly the painting follows the photograph. Half way reproduces
+# the settings these were tuned to by hand; see Style below for what it moves.
+DEFAULT_TIGHTNESS = 0.5
 
 
 def paint(
@@ -167,12 +156,15 @@ def paint(
     palette_colours: np.ndarray,
     radii: list[int] | None = None,
     seed: int = 0,
-    jitter: float = COLOUR_JITTER,
+    jitter: float | None = None,
     recorder: "Recorder | None" = None,
     fallback_angle: float = FALLBACK_ANGLE,
+    style: Style | None = None,
 ) -> Image.Image:
     """Work from the coarsest brush to the finest, refining what the last one missed."""
-    radii = BRUSH_RADII if radii is None else radii
+    style = Style.from_tightness(DEFAULT_TIGHTNESS) if style is None else style
+    radii = style.brushes(BRUSH_RADII if radii is None else radii)
+    jitter = style.jitter if jitter is None else jitter
     height, width, _ = image.shape
     generator = np.random.default_rng(seed)
 
@@ -199,7 +191,7 @@ def paint(
         reference = gaussian_filter(
             image, sigma=(BLUR_PER_RADIUS * radius, BLUR_PER_RADIUS * radius, 0)
         )
-        strokes = _plan_layer(np.asarray(scratch) / 255.0, reference, radius)
+        strokes = _plan_layer(np.asarray(scratch) / 255.0, reference, radius, style)
         generator.shuffle(strokes)
         planned.append((radius, reference, strokes))
         # A rough stand-in for what the layer will do, good enough to plan the next one.
@@ -220,7 +212,7 @@ def paint(
     for (radius, reference, strokes), frames in zip(planned, budget):
         _draw_layer(
             canvas, relief, strokes, reference, radius, snap, generator, jitter,
-            hatching, recorder, frames,
+            hatching, style, recorder, frames,
         )
         print(f"    brush {radius:3d}px  {len(strokes):6d} strokes")
 
@@ -228,6 +220,60 @@ def paint(
         recorder.frame(canvas, relief, times=round(VIDEO_HOLD_SECONDS * VIDEO_FPS))
 
     return _apply_impasto(canvas, relief)
+
+
+@dataclass(frozen=True)
+class Style:
+    """How tightly the painting follows the photograph.
+
+    Looseness is not one setting but four moving together, which is why it is worth a
+    dial of its own. A loose painting uses a big brush, lets a stroke run a long way
+    before it stops, tolerates a patch being some way off before going back to it, and
+    varies its colour freely. A tight one does the opposite on all four counts, and
+    changing any one of them alone mostly just makes the picture worse.
+
+    ``tightness`` runs from 0 to 1 and interpolates geometrically between the two, since
+    every one of these is a scale rather than a position -- halfway between a threshold
+    of 16 and one of 3.5 is 7.5, not 9.75. Half way reproduces the values these settings
+    were hand-tuned to.
+    """
+
+    repaint_threshold: float
+    maximum_stroke: int
+    stroke_tolerance: float
+    jitter: float
+    brush_scale: float
+
+    @classmethod
+    def from_tightness(cls, tightness: float) -> "Style":
+        tightness = float(np.clip(tightness, 0.0, 1.0))
+
+        def between(loose: float, tight: float) -> float:
+            return loose * (tight / loose) ** tightness
+
+        return cls(
+            # How wrong a patch has to be before the next brush goes back to it.
+            repaint_threshold=between(16.0, 3.5),
+            # How far a stroke may run, in brush radii.
+            maximum_stroke=max(MINIMUM_STROKE + 1, round(between(18.0, 6.0))),
+            # How far its colour may drift before it is cut short.
+            stroke_tolerance=between(40.0, 12.0),
+            # How much each stroke's colour is nudged before being snapped to a mixture.
+            jitter=between(8.0, 2.5),
+            # And how big the brushes are, against the sizes named in BRUSH_RADII.
+            brush_scale=between(1.5, 0.65),
+        )
+
+    def brushes(self, radii: list[int]) -> list[int]:
+        """The brush sizes this style actually paints with."""
+        return [max(2, round(radius * self.brush_scale)) for radius in radii]
+
+    def describe(self) -> str:
+        return (
+            f"brushes {self.brushes(BRUSH_RADII)}, repaint over "
+            f"{self.repaint_threshold:.1f}, stroke <= {self.maximum_stroke}, "
+            f"tolerance {self.stroke_tolerance:.0f}, jitter {self.jitter:.1f}"
+        )
 
 
 class Recorder:
@@ -376,7 +422,7 @@ def _orientation_field(
 
 
 def _plan_layer(
-    canvas: np.ndarray, reference: np.ndarray, radius: int
+    canvas: np.ndarray, reference: np.ndarray, radius: int, style: Style
 ) -> list[tuple[int, int]]:
     """Where this brush is needed: the worst pixel of every cell that is not good enough.
 
@@ -398,7 +444,7 @@ def _plan_layer(
     blocks = padded.reshape(cells_down, radius, cells_across, radius).swapaxes(1, 2)
 
     flattened = blocks.reshape(cells_down, cells_across, radius * radius)
-    needs_paint = flattened.mean(axis=2) > REPAINT_THRESHOLD
+    needs_paint = flattened.mean(axis=2) > style.repaint_threshold
 
     worst = flattened.argmax(axis=2)
     cell_rows, cell_columns = np.nonzero(needs_paint)
@@ -431,7 +477,7 @@ def _preview_layer(canvas, reference, strokes, radius):
 
 def _draw_layer(
     canvas, height, strokes, reference, radius, snap, generator, jitter, hatching,
-    recorder=None, frames=0,
+    style, recorder=None, frames=0,
 ) -> None:
     """Trace and paint every stroke of one layer, and record how thick the paint got."""
     brush = ImageDraw.Draw(canvas)
@@ -461,7 +507,8 @@ def _draw_layer(
 
     for index, (x, y) in enumerate(strokes):
         points = _trace_stroke(
-            x, y, radius, tangent, hatching, trust, reference_lab, loaded[index]
+            x, y, radius, tangent, hatching, trust, reference_lab, loaded[index],
+            style,
         )
         width = radius * widths[index]
         tracks = _bristle_tracks(points, width, generator)
@@ -516,6 +563,7 @@ def _trace_stroke(
     trust: np.ndarray,
     reference_lab: np.ndarray,
     started_from: np.ndarray,
+    style: Style,
 ) -> list[tuple[float, float]]:
     """Follow the picture from a starting point, as far as the picture is worth following.
 
@@ -533,14 +581,14 @@ def _trace_stroke(
     position = np.array([float(x), float(y)])
     last_direction = np.zeros(2)
 
-    for step in range(MAXIMUM_STROKE):
+    for step in range(style.maximum_stroke):
         column, row = int(round(position[0])), int(round(position[1]))
         if not (0 <= column < width and 0 <= row < height):
             break
 
         if step >= MINIMUM_STROKE:
             drifted = np.linalg.norm(reference_lab[row, column] - started_from)
-            if drifted > STROKE_TOLERANCE:
+            if drifted > style.stroke_tolerance:
                 break
 
         confidence = trust[row, column]
@@ -674,9 +722,10 @@ def main(
     seed: int = 0,
     longest_side: int = 1400,
     radii: list[int] | None = None,
-    jitter: float = COLOUR_JITTER,
+    jitter: float | None = None,
     video: str | None = None,
     fallback_angle: float = FALLBACK_ANGLE,
+    tightness: float = DEFAULT_TIGHTNESS,
 ) -> None:
     source_path = Path(source)
     destination_path = (
@@ -695,6 +744,9 @@ def main(
 
     image = np.asarray(original, dtype=float) / 255.0
     print(f"\n  {source_path.name}: painting at {image.shape[1]} x {image.shape[0]}")
+
+    style = Style.from_tightness(tightness)
+    print(f"  tightness {tightness:.2f}: {style.describe()}")
 
     palette = build_palette()
     palette_colours, weights = build_chit_colours(palette)
@@ -719,6 +771,7 @@ def main(
         jitter=jitter,
         recorder=recorder,
         fallback_angle=fallback_angle,
+        style=style,
     )
     painting.save(destination_path)
 
@@ -758,11 +811,18 @@ if __name__ == "__main__":
         "smallest gives a looser painting; adding one drives it towards the photograph",
     )
     parser.add_argument(
+        "-t",
+        "--tightness",
+        type=float,
+        default=DEFAULT_TIGHTNESS,
+        help="how closely the painting follows the photograph, from 0 for broad and "
+        "loose to 1 for controlled and detailed (default %(default)s). Moves the brush "
+        "sizes, the repaint threshold, the stroke length and the colour jitter together",
+    )
+    parser.add_argument(
         "--jitter",
         type=float,
-        default=COLOUR_JITTER,
-        help="vary each stroke's colour by about this much before snapping it to a "
-        "mixture (default %(default)s, 0 to disable)",
+        help="override the colour jitter the tightness would choose (0 to disable)",
     )
     parser.add_argument(
         "--fallback-angle",
@@ -794,4 +854,5 @@ if __name__ == "__main__":
         arguments.jitter,
         arguments.video,
         arguments.fallback_angle,
+        arguments.tightness,
     )
