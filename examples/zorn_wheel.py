@@ -1,16 +1,21 @@
-"""A colour wheel built from the Zorn palette by repeated halving.
+"""A colour wheel built from the Zorn palette by repeated halving, then tinted with white.
 
 Anders Zorn is said to have painted with four colours: yellow ochre, vermilion, ivory
 black and white. This example takes the three chromatic ones, spaces them equally around
-a circle, and then fills the circle in by repeatedly placing a new chit between each
-neighbouring pair, mixed from them in equal proportion.
+a circle, and fills the circle in by repeatedly placing a new chit between each
+neighbouring pair, mixed from them in equal proportion. That gives the hues.
 
-What makes this worth looking at is that the arcs are not gradients. Every chit is a
-Kubelka-Munk mixture of real pigment coefficients, so the wheel bends where paint bends:
-ivory black and yellow ochre meet in olive green, not in grey, because black is not a
-neutral darkener but a pigment with a colour of its own.
+Titanium white is then added to every one of those chits in increasing proportion, and
+each tint is placed further out from the centre. So angle carries the hue and radius
+carries the white: the middle of the disc is the pure mixtures, the rim is those same
+mixtures at their palest.
 
-Run it with:  python examples/zorn_wheel.py [rounds]
+The tints are the part worth looking at. Ivory black is so much the strongest absorber
+here that most of the wheel collapses into near-black before any white is added -- three
+parts vermilion to one part black is already almost unreadable. Add white and those same
+mixtures open out into the greens, olives and mauves that were in them all along.
+
+Run it with:  python examples/zorn_wheel.py [rounds] [tints]
 """
 
 from __future__ import annotations
@@ -24,64 +29,92 @@ import numpy as np
 from kubelka_munk import Paint, Palette
 
 # name, masstone, tinting strength -- approximations, as everywhere in this library.
-ZORN_TRIAD = [
+ZORN_HUES = [
     ("Yellow Ochre", "#c8a02c", 2.0),
     ("Vermilion", "#e34234", 2.5),
     ("Ivory Black", "#23201e", 4.0),
 ]
+TITANIUM_WHITE = ("Titanium White", "#fbfaf6", 10.0)
+
+# How pale the outermost ring gets. Titanium white scatters so strongly that going much
+# beyond this washes every hue out to the same near-white.
+MOST_WHITE = 0.75
 
 SVG_FILENAME = "zorn_wheel.svg"
 
 
 @dataclass(frozen=True)
 class Chit:
-    """One painted square on the wheel: where it sits, and what is in it.
+    """One painted square on the disc: where it sits, and what is in it.
 
-    The weights are proportions of the three primaries. Holding them, rather than just a
-    colour, is what lets two chits be mixed again: under Kubelka-Munk the coefficients of
-    a mixture add in proportion, so mixing two chits in equal parts is exactly averaging
-    their weights.
+    The weights are proportions of the whole palette, white included. Holding them,
+    rather than just a colour, is what lets two chits be mixed again: under Kubelka-Munk
+    the coefficients of a mixture add in proportion, so mixing two chits in equal parts
+    is exactly averaging their weights.
     """
 
     angle_degrees: float
+    ring: int
+    white_fraction: float
     weights: np.ndarray
-    generation: int
+    is_primary: bool
 
 
-def build_wheel(palette: Palette, rounds: int) -> list[Chit]:
-    """Space the primaries around a circle, then halve the gaps ``rounds`` times."""
-    chits = [
-        Chit(
-            angle_degrees=index * 360.0 / len(palette),
-            weights=np.eye(len(palette))[index],
-            generation=0,
-        )
-        for index in range(len(palette))
+def build_hues(hue_count: int, rounds: int) -> list[tuple[float, np.ndarray]]:
+    """Space the primaries around a circle, then halve the gaps ``rounds`` times.
+
+    Returns angles paired with proportions of the chromatic paints only. White is added
+    afterwards, so that halving mixes hue with hue and never with a tint.
+    """
+    hues = [
+        (index * 360.0 / hue_count, np.eye(hue_count)[index]) for index in range(hue_count)
     ]
+    for _ in range(rounds):
+        hues = _fill_the_gaps(hues)
+    return hues
 
-    for generation in range(1, rounds + 1):
-        chits = _fill_the_gaps(chits, generation)
-    return chits
 
-
-def _fill_the_gaps(chits: list[Chit], generation: int) -> list[Chit]:
-    """Put a new chit between every neighbouring pair, mixed from them half and half."""
-    filled: list[Chit] = []
-    for position, chit in enumerate(chits):
-        neighbour = chits[(position + 1) % len(chits)]
+def _fill_the_gaps(
+    hues: list[tuple[float, np.ndarray]]
+) -> list[tuple[float, np.ndarray]]:
+    """Put a new hue between every neighbouring pair, mixed from them half and half."""
+    filled: list[tuple[float, np.ndarray]] = []
+    for position, (angle, weights) in enumerate(hues):
+        neighbour_angle, neighbour_weights = hues[(position + 1) % len(hues)]
 
         # Going the short way round, so the last pair wraps past 360 correctly.
-        gap = (neighbour.angle_degrees - chit.angle_degrees) % 360.0
+        gap = (neighbour_angle - angle) % 360.0
 
-        filled.append(chit)
-        filled.append(
-            Chit(
-                angle_degrees=(chit.angle_degrees + gap / 2) % 360.0,
-                weights=(chit.weights + neighbour.weights) / 2,
-                generation=generation,
-            )
-        )
+        filled.append((angle, weights))
+        filled.append(((angle + gap / 2) % 360.0, (weights + neighbour_weights) / 2))
     return filled
+
+
+def add_tints(hues: list[tuple[float, np.ndarray]], tints: int) -> list[Chit]:
+    """Give every hue a run of chits, each with more white than the last.
+
+    Ring 0 holds the hue itself. Each ring outwards replaces a larger share of the chit
+    with titanium white, so a chit's distance from the centre is how much white is in it.
+    """
+    white_fractions = (
+        np.linspace(0.0, MOST_WHITE, tints) if tints > 1 else np.zeros(1)
+    )
+
+    chits = []
+    for angle, hue_weights in hues:
+        for ring, white_fraction in enumerate(white_fractions):
+            chits.append(
+                Chit(
+                    angle_degrees=angle,
+                    ring=ring,
+                    white_fraction=float(white_fraction),
+                    weights=np.append(
+                        hue_weights * (1.0 - white_fraction), white_fraction
+                    ),
+                    is_primary=bool(np.max(hue_weights) == 1.0),
+                )
+            )
+    return chits
 
 
 def describe(palette: Palette, chit: Chit) -> tuple[str, str]:
@@ -93,25 +126,29 @@ def describe(palette: Palette, chit: Chit) -> tuple[str, str]:
     return mixture.hex_colour, recipe
 
 
-def print_the_ring(palette: Palette, chits: list[Chit], radius: int = 9) -> None:
-    """Draw the wheel with coloured blocks, for terminals that can manage 24-bit colour."""
-    height, width = 2 * radius + 3, 4 * radius + 6
-    canvas = [[None] * width for _ in range(height)]
+def print_the_disc(palette: Palette, chits: list[Chit], rings: int) -> None:
+    """Draw the disc with coloured blocks, for terminals that can manage 24-bit colour."""
+    innermost, spacing = 6, 3
+    outermost = innermost + spacing * (rings - 1)
+    height, width = 2 * outermost + 3, 4 * outermost + 8
+    canvas: list[list[str | None]] = [[None] * width for _ in range(height)]
 
     for chit in chits:
         # Zero degrees at the top, running clockwise, as a colour wheel is usually drawn.
         radians = math.radians(chit.angle_degrees)
-        row = round(radius + 1 - radius * math.cos(radians))
+        radius = innermost + spacing * chit.ring
+        row = round(outermost + 1 - radius * math.cos(radians))
         column = round(width / 2 + 2 * radius * math.sin(radians))
         colour = palette.mix(chit.weights).hex_colour
 
-        for cell in range(-2, 2):
+        for cell in (-1, 0):
             if 0 <= row < height and 0 <= column + cell < width:
                 canvas[row][column + cell] = colour
 
     print()
     for line in canvas:
         print("".join(" " if c is None else _block(c) for c in line))
+    print("\n  centre: no white.  rim: {:.0%} white.".format(MOST_WHITE))
 
 
 def _block(hex_colour: str) -> str:
@@ -120,58 +157,106 @@ def _block(hex_colour: str) -> str:
     return f"\033[48;2;{red};{green};{blue}m \033[0m"
 
 
-def print_the_legend(palette: Palette, chits: list[Chit]) -> None:
-    print("\n  angle   colour     mixed from")
-    print("  " + "-" * 62)
-    for chit in sorted(chits, key=lambda c: c.angle_degrees):
-        colour, recipe = describe(palette, chit)
-        marker = "*" if chit.generation == 0 else " "
-        print(f"  {chit.angle_degrees:5.1f}  {marker} {_block(colour) * 3} {colour}  {recipe}")
-    print("\n  * the three primaries; everything else is mixed from its neighbours")
+def print_the_legend(palette: Palette, chits: list[Chit], rings: int) -> None:
+    """One row per hue, one column per tint, so the tinting can be read across."""
+    by_angle: dict[float, list[Chit]] = {}
+    for chit in chits:
+        by_angle.setdefault(chit.angle_degrees, []).append(chit)
+
+    fractions = [chit.white_fraction for chit in sorted(by_angle[0.0], key=lambda c: c.ring)]
+    header = "".join(f"  {fraction:>6.0%} white" for fraction in fractions)
+    print(f"\n  angle {header}   hue")
+    print("  " + "-" * (20 + 13 * rings))
+
+    for angle in sorted(by_angle):
+        row = sorted(by_angle[angle], key=lambda c: c.ring)
+        cells = ""
+        for chit in row:
+            colour, _ = describe(palette, chit)
+            cells += f"  {_block(colour) * 2} {colour}"
+
+        _, hue_recipe = describe(palette, row[0])
+        marker = "*" if row[0].is_primary else " "
+        print(f"  {angle:5.1f} {marker}{cells}   {hue_recipe}")
+
+    print("\n  * the three chromatic primaries; the rest are mixed from their neighbours")
 
 
-def write_svg(palette: Palette, chits: list[Chit], path: str) -> None:
-    """Write the wheel out as an SVG, since a colour wheel deserves better than a terminal."""
-    size, ring_radius, chit_radius = 700, 210, 34
+def write_svg(
+    palette: Palette,
+    chits: list[Chit],
+    rings: int,
+    label_angle: float,
+    path: str,
+) -> None:
+    """Write the disc out as an SVG, since a colour wheel deserves better than a terminal."""
+    innermost, spacing, chit_radius = 96, 52, 21
+    outermost = innermost + spacing * (rings - 1)
+    size = 2 * (outermost + chit_radius + 34)
     centre = size / 2
 
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '
         f'viewBox="0 0 {size} {size}">',
         f'<rect width="{size}" height="{size}" fill="#f4f2ee"/>',
-        f'<circle cx="{centre}" cy="{centre}" r="{ring_radius}" fill="none" '
-        f'stroke="#d8d4cc" stroke-width="1"/>',
     ]
+
+    for ring in range(rings):
+        parts.append(
+            f'<circle cx="{centre}" cy="{centre}" r="{innermost + spacing * ring}" '
+            f'fill="none" stroke="#e2ded6" stroke-width="1"/>'
+        )
 
     for chit in chits:
         radians = math.radians(chit.angle_degrees)
-        x = centre + ring_radius * math.sin(radians)
-        y = centre - ring_radius * math.cos(radians)
+        radius = innermost + spacing * chit.ring
+        x = centre + radius * math.sin(radians)
+        y = centre - radius * math.cos(radians)
         colour, _ = describe(palette, chit)
 
-        outline = "#3a3a3a" if chit.generation == 0 else "#b9b4ab"
-        width = 2.5 if chit.generation == 0 else 1
+        # The undiluted primaries are ringed, so the three corners stay findable once
+        # the disc fills up.
+        ringed = chit.is_primary and chit.ring == 0
         parts.append(
             f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{chit_radius}" fill="{colour}" '
-            f'stroke="{outline}" stroke-width="{width}"/>'
+            f'stroke="{"#3a3a3a" if ringed else "#cdc8bf"}" '
+            f'stroke-width="{2.5 if ringed else 0.8}"/>'
         )
 
-        label_radius = ring_radius + chit_radius + 26
+    # The ring labels go on a ray that falls between two hues, so they never land on a
+    # chit however finely the wheel is subdivided.
+    label_radians = math.radians(label_angle)
+    for ring in range(rings):
+        radius = innermost + spacing * ring
+        x = centre + radius * math.sin(label_radians)
+        y = centre - radius * math.cos(label_radians)
+        # A pill in the background colour, so a label stays readable even where the ring
+        # it names runs close to a chit.
         parts.append(
-            f'<text x="{centre + label_radius * math.sin(radians):.1f}" '
-            f'y="{centre - label_radius * math.cos(radians):.1f}" '
-            f'font-family="ui-monospace, monospace" font-size="11" fill="#55524c" '
-            f'text-anchor="middle" dominant-baseline="middle">{colour}</text>'
+            f'<rect x="{x - 14:.1f}" y="{y - 8:.1f}" width="28" height="16" rx="8" '
+            f'fill="#f4f2ee"/>'
         )
+        parts.append(
+            f'<text x="{x:.1f}" y="{y:.1f}" '
+            f'font-family="ui-monospace, monospace" font-size="10" fill="#9a958c" '
+            f'text-anchor="middle" dominant-baseline="middle">'
+            f'{chits[ring].white_fraction:.0%}</text>'
+        )
+    parts.append(
+        f'<text x="{centre + (outermost + chit_radius + 16) * math.sin(label_radians):.1f}" '
+        f'y="{centre - (outermost + chit_radius + 16) * math.cos(label_radians):.1f}" '
+        f'font-family="ui-monospace, monospace" font-size="10" fill="#8a857c" '
+        f'text-anchor="middle" dominant-baseline="middle">white</text>'
+    )
 
     parts.append(
-        f'<text x="{centre}" y="{centre - 8}" font-family="Georgia, serif" '
-        f'font-size="17" fill="#55524c" text-anchor="middle">Zorn palette</text>'
+        f'<text x="{centre}" y="{centre - 6}" font-family="Georgia, serif" '
+        f'font-size="16" fill="#55524c" text-anchor="middle">Zorn palette</text>'
     )
     parts.append(
         f'<text x="{centre}" y="{centre + 14}" font-family="Georgia, serif" '
-        f'font-size="12" fill="#8a857c" text-anchor="middle">'
-        f'mixed with Kubelka-Munk</text>'
+        f'font-size="11" fill="#8a857c" text-anchor="middle">'
+        f'hue around, white outward</text>'
     )
     parts.append("</svg>")
 
@@ -179,24 +264,30 @@ def write_svg(palette: Palette, chits: list[Chit], path: str) -> None:
         handle.write("\n".join(parts))
 
 
-def main(rounds: int = 2) -> None:
+def main(rounds: int = 2, tints: int = 4) -> None:
     palette = Palette(
         Paint.from_srgb(name, colour, tinting_strength=strength)
-        for name, colour, strength in ZORN_TRIAD
+        for name, colour, strength in [*ZORN_HUES, TITANIUM_WHITE]
     )
 
-    chits = build_wheel(palette, rounds)
+    hues = build_hues(len(ZORN_HUES), rounds)
+    chits = add_tints(hues, tints)
     print(
-        f"\n  {len(palette)} primaries, halved {rounds} time"
-        f"{'s' if rounds != 1 else ''} -> {len(chits)} chits"
+        f"\n  {len(ZORN_HUES)} primaries, halved {rounds} time"
+        f"{'s' if rounds != 1 else ''} -> {len(hues)} hues"
+        f", each tinted {tints} ways -> {len(chits)} chits"
     )
 
-    print_the_ring(palette, chits)
-    print_the_legend(palette, chits)
+    print_the_disc(palette, chits, tints)
+    print_the_legend(palette, chits, tints)
 
-    write_svg(palette, chits, SVG_FILENAME)
+    # A ray halfway between the first two hues, kept clear for the ring labels.
+    label_angle = (hues[0][0] + hues[1][0]) / 2 if len(hues) > 1 else 45.0
+
+    write_svg(palette, chits, tints, label_angle, SVG_FILENAME)
     print(f"\n  wrote {SVG_FILENAME}\n")
 
 
 if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 2)
+    arguments = [int(value) for value in sys.argv[1:3]]
+    main(*arguments)
