@@ -151,6 +151,11 @@ FRAME_WEIGHT = 0.3
 # and spending it evenly over a picture is part of what makes one read as a photograph.
 BACKGROUND_LOOSER_BY = 0.25
 
+# Filling the subject's area in so there is a background to paint behind him: how hard,
+# and how many times, the nearest-neighbour fill is smoothed to relax its streaks.
+INPAINT_SMOOTHING = 9.0
+INPAINT_RELAXATIONS = 12
+
 # The one dial for how tightly the painting follows the photograph. Half way reproduces
 # the settings these were tuned to by hand; see Style below for what it moves.
 DEFAULT_TIGHTNESS = 0.5
@@ -178,9 +183,12 @@ def paint(
     belongs instead of being chewed by strokes that began inside the face and ran out
     into the sky.
 
-    The background's strokes are deliberately *not* confined. They run on past the
-    silhouette and are simply covered up, which is both simpler and closer to how the
-    thing is actually done.
+    The background's strokes are deliberately not confined. It is painted across the
+    whole canvas, the subject's area included -- his shape is filled in beforehand with a
+    plausible continuation of what surrounds it -- so the ground is complete before he is
+    put in front of it. That is how the thing is actually done, and it matters here
+    because the cut-out's edge is soft: paint the background only up to the silhouette
+    and the bare canvas shows through along it as a halo.
     """
     style = Style.from_tightness(DEFAULT_TIGHTNESS) if style is None else style
     background_style = style if background_style is None else background_style
@@ -193,12 +201,16 @@ def paint(
     # lay paint where the picture does not say.
     hatching = _hatching_field((height, width), fallback_angle, generator)
 
+    # Each pass names the region it takes its colours from, and the region it is allowed
+    # to lay paint in. For the background those differ: it draws on the background only,
+    # but paints the entire canvas, the subject's area included, so the ground is
+    # complete before he is put in front of it.
     if foreground is None:
-        passes = [("picture", None, style)]
+        passes = [("picture", None, None, style)]
     else:
         passes = [
-            ("background", 1.0 - foreground, background_style),
-            ("subject", foreground, style),
+            ("background", 1.0 - foreground, None, background_style),
+            ("subject", foreground, foreground, style),
         ]
 
     # Start from the picture's average colour, so that anywhere the brushes never visit
@@ -214,24 +226,24 @@ def paint(
     # the film's running time can be shared out between them.
     plans = []
     scratch = canvas.copy()
-    for label, region, pass_style in passes:
-        subject = image if region is None else _isolate(image, region)
-        region_mask = (
+    for label, seen, paintable, pass_style in passes:
+        subject = image if seen is None else _inpaint(image, seen)
+        stencil = (
             None
-            if region is None
-            else Image.fromarray((region * 255).astype(np.uint8), "L")
+            if paintable is None
+            else Image.fromarray((paintable * 255).astype(np.uint8), "L")
         )
         for radius in pass_style.brushes(radii or BRUSH_RADII):
             reference = gaussian_filter(
                 subject, sigma=(BLUR_PER_RADIUS * radius, BLUR_PER_RADIUS * radius, 0)
             )
             strokes = _plan_layer(
-                np.asarray(scratch) / 255.0, reference, radius, pass_style, region
+                np.asarray(scratch) / 255.0, reference, radius, pass_style, paintable
             )
             generator.shuffle(strokes)
-            plans.append((label, region_mask, pass_style, radius, reference, strokes))
+            plans.append((label, stencil, pass_style, radius, reference, strokes))
             # A rough stand-in for what the layer will do, good enough to plan the next.
-            scratch = _preview_layer(scratch, reference, strokes, radius, region_mask)
+            scratch = _preview_layer(scratch, reference, strokes, radius, stencil)
 
     budget = (
         _plan_frames(
@@ -366,21 +378,33 @@ def foreground_mask(image: Image.Image, model: str = "u2net") -> np.ndarray:
     return np.asarray(cut_out)[..., 3].astype(float) / 255.0
 
 
-def _isolate(image: np.ndarray, region: np.ndarray) -> np.ndarray:
-    """Flood everything outside the region with the nearest colour inside it.
+def _inpaint(image: np.ndarray, region: np.ndarray) -> np.ndarray:
+    """Fill everything outside the region with a plausible continuation of what is inside.
 
-    Every pass blurs the photograph to match its brush, and a blur does not respect a
-    silhouette. Blurred for the background pass, the subject's face bleeds outward, and
-    the background would be painted in skin tones for a brush-width all around him.
-    Replacing the far side with its nearest neighbour first leaves the blur nothing to
-    drag across the boundary.
+    Two reasons the background pass needs this. A blur does not respect a silhouette, so
+    without it the subject's face would bleed outward and the background be painted in
+    skin tones for a brush-width all around him. And the background is painted across the
+    whole canvas, the subject included, so there has to be something behind him to paint.
+
+    The method is about as simple as inpainting gets: fill each unknown pixel with its
+    nearest known one, then repeatedly blur while holding the known pixels fixed. The
+    first step fills everything immediately, and the second lets the fill relax from the
+    hard radial streaks the nearest-neighbour pass leaves into something smooth. It
+    invents nothing and knows nothing about structure, which is the right amount of
+    ambition for paint that ends up underneath a portrait.
     """
-    outside = region < 0.5
-    if not outside.any():
+    unknown = region < 0.5
+    if not unknown.any():
         return image
 
-    _, nearest = distance_transform_edt(outside, return_indices=True)
-    return image[nearest[0], nearest[1]]
+    _, nearest = distance_transform_edt(unknown, return_indices=True)
+    filled = image[nearest[0], nearest[1]]
+
+    known = ~unknown
+    for _ in range(INPAINT_RELAXATIONS):
+        filled = gaussian_filter(filled, sigma=(INPAINT_SMOOTHING, INPAINT_SMOOTHING, 0))
+        filled[known] = image[known]
+    return filled
 
 
 class Recorder:
