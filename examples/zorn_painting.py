@@ -64,12 +64,19 @@ CURVATURE = 0.4
 # is cut short, in units of colour difference.
 STROKE_TOLERANCE = 25.0
 
+# How much each stroke's colour is nudged before it is snapped to a mixture, in units of
+# colour difference. A real brush is never loaded twice with quite the same colour, and a
+# passage painted in one flat tint looks printed rather than painted. Setting this to
+# zero turns the jitter off.
+COLOUR_JITTER = 5.0
+
 
 def paint(
     image: np.ndarray,
     palette_colours: np.ndarray,
     radii: list[int] | None = None,
     seed: int = 0,
+    jitter: float = COLOUR_JITTER,
 ) -> Image.Image:
     """Work from the coarsest brush to the finest, refining what the last one missed."""
     radii = BRUSH_RADII if radii is None else radii
@@ -80,7 +87,8 @@ def paint(
 
     # Start from the picture's average colour, so that anywhere the brushes never visit
     # still reads as part of the painting rather than as a hole.
-    canvas = Image.new("RGB", (width, height), tuple(snap(image.mean(axis=(0, 1)))))
+    average = xyz_to_lab(srgb_to_xyz(image.mean(axis=(0, 1))))
+    canvas = Image.new("RGB", (width, height), snap(average))
 
     for radius in radii:
         reference = gaussian_filter(
@@ -89,7 +97,7 @@ def paint(
         strokes = _plan_layer(np.asarray(canvas) / 255.0, reference, radius)
         generator.shuffle(strokes)
 
-        _draw_layer(canvas, strokes, reference, radius, snap)
+        _draw_layer(canvas, strokes, reference, radius, snap, generator, jitter)
         print(f"    brush {radius:3d}px  {len(strokes):6d} strokes")
 
     return canvas
@@ -131,7 +139,7 @@ def _plan_layer(
     return list(zip(columns[inside].tolist(), rows[inside].tolist()))
 
 
-def _draw_layer(canvas, strokes, reference, radius, snap) -> None:
+def _draw_layer(canvas, strokes, reference, radius, snap, generator, jitter) -> None:
     """Trace and paint every stroke of one layer."""
     brush = ImageDraw.Draw(canvas)
 
@@ -144,10 +152,19 @@ def _draw_layer(canvas, strokes, reference, radius, snap) -> None:
 
     reference_lab = xyz_to_lab(srgb_to_xyz(reference))
 
-    for x, y in strokes:
-        colour = snap(reference[y, x])
+    # One nudge per stroke, not per pixel: a brush is loaded once and then painted with.
+    # The jitter is applied in CIELAB and measured in colour difference, so the amount
+    # means the same thing whatever the colour -- an equal nudge to a dark red and a pale
+    # grey looks equally strong, which is not true of jittering the RGB values.
+    nudges = generator.normal(0.0, jitter, size=(len(strokes), 3)) if jitter else None
+
+    for index, (x, y) in enumerate(strokes):
+        loaded = reference_lab[y, x]
+        colour = snap(loaded if nudges is None else loaded + nudges[index])
+        # The stroke's path follows the photograph, not the nudged colour -- jitter is
+        # meant to vary the paint, not to send the brush somewhere else.
         points = _trace_stroke(
-            x, y, radius, gradient_x, gradient_y, reference_lab, reference_lab[y, x]
+            x, y, radius, gradient_x, gradient_y, reference_lab, loaded
         )
 
         if len(points) > 1:
@@ -219,12 +236,17 @@ def _trace_stroke(
 
 
 def _palette_snapper(palette_colours: np.ndarray):
-    """A function from any colour to the nearest mixture, as 8-bit RGB for drawing."""
+    """A function from a CIELAB colour to the nearest mixture, as RGB bytes for drawing.
+
+    Works in CIELAB throughout, because that is the space the strokes are chosen and
+    jittered in, and converting back and forth per stroke would be both slower and
+    slightly lossy.
+    """
     tree = cKDTree(xyz_to_lab(srgb_to_xyz(palette_colours)))
     as_bytes = np.clip(np.round(palette_colours * 255), 0, 255).astype(int)
 
-    def snap(colour: np.ndarray) -> tuple[int, int, int]:
-        _, index = tree.query(xyz_to_lab(srgb_to_xyz(np.clip(colour, 0.0, 1.0))))
+    def snap(lab: np.ndarray) -> tuple[int, int, int]:
+        _, index = tree.query(lab)
         return tuple(as_bytes[index].tolist())
 
     return snap
@@ -237,6 +259,7 @@ def main(
     seed: int = 0,
     longest_side: int = 1400,
     radii: list[int] | None = None,
+    jitter: float = COLOUR_JITTER,
 ) -> None:
     source_path = Path(source)
     destination_path = (
@@ -263,7 +286,7 @@ def main(
         palette_colours = palette_colours[keep]
         print(f"  restricted to {len(keep)} mixtures")
 
-    painting = paint(image, palette_colours, radii=radii, seed=seed)
+    painting = paint(image, palette_colours, radii=radii, seed=seed, jitter=jitter)
     painting.save(destination_path)
 
     difference = np.linalg.norm(
@@ -297,6 +320,13 @@ if __name__ == "__main__":
         "smallest gives a looser painting; adding one drives it towards the photograph",
     )
     parser.add_argument(
+        "--jitter",
+        type=float,
+        default=COLOUR_JITTER,
+        help="vary each stroke's colour by about this much before snapping it to a "
+        "mixture (default %(default)s, 0 to disable)",
+    )
+    parser.add_argument(
         "--longest-side",
         type=int,
         default=1400,
@@ -310,4 +340,5 @@ if __name__ == "__main__":
         arguments.seed,
         arguments.longest_side,
         [int(radius) for radius in arguments.brushes.split(",")],
+        arguments.jitter,
     )
