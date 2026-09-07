@@ -106,14 +106,16 @@ def _fill_the_gaps(
     return filled
 
 
-def add_tints(hues: list[tuple[float, np.ndarray]], tints: int) -> list[Chit]:
+def add_tints(
+    hues: list[tuple[float, np.ndarray]], tints: int, most_white: float = MOST_WHITE
+) -> list[Chit]:
     """Give every hue a run of chits, each with more white than the last.
 
     Ring 0 holds the hue itself. Each ring outwards replaces a larger share of the chit
     with titanium white, so a chit's distance from the centre is how much white is in it.
     """
     white_fractions = (
-        np.linspace(0.0, MOST_WHITE, tints) if tints > 1 else np.zeros(1)
+        np.linspace(0.0, most_white, tints) if tints > 1 else np.zeros(1)
     )
 
     chits = []

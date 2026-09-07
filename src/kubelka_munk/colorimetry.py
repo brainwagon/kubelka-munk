@@ -65,13 +65,17 @@ def decode_srgb(encoded: np.ndarray) -> np.ndarray:
 
 
 def xyz_to_srgb(xyz: np.ndarray) -> np.ndarray:
-    """Display-ready sRGB in [0, 1]. Out-of-gamut colours are clipped, not gamut-mapped."""
-    return encode_srgb(XYZ_TO_LINEAR_SRGB @ np.asarray(xyz, dtype=float))
+    """Display-ready sRGB in [0, 1]. Out-of-gamut colours are clipped, not gamut-mapped.
+
+    Accepts one colour or any stack of them, the last axis being the three components,
+    so a whole image can be converted at once.
+    """
+    return encode_srgb(np.asarray(xyz, dtype=float) @ XYZ_TO_LINEAR_SRGB.T)
 
 
 def srgb_to_xyz(srgb: np.ndarray) -> np.ndarray:
-    """CIE XYZ of a display colour given as sRGB in [0, 1]."""
-    return LINEAR_SRGB_TO_XYZ @ decode_srgb(np.asarray(srgb, dtype=float))
+    """CIE XYZ of a display colour given as sRGB in [0, 1], one colour or a stack."""
+    return decode_srgb(np.asarray(srgb, dtype=float)) @ LINEAR_SRGB_TO_XYZ.T
 
 
 def spectrum_to_srgb(spectrum: Spectrum) -> np.ndarray:
@@ -100,7 +104,10 @@ def hex_to_srgb(colour: str) -> np.ndarray:
 
 
 def xyz_to_lab(xyz: np.ndarray, white_point: np.ndarray | None = None) -> np.ndarray:
-    """CIE 1976 L*a*b*, in which equal distances are roughly equal perceived differences."""
+    """CIE 1976 L*a*b*, in which equal distances are roughly equal perceived differences.
+
+    Accepts one colour or any stack of them, the last axis being the three components.
+    """
     white_point = D65_WHITE_POINT_XYZ if white_point is None else white_point
     ratio = np.asarray(xyz, dtype=float) / white_point
 
@@ -112,21 +119,22 @@ def xyz_to_lab(xyz: np.ndarray, white_point: np.ndarray | None = None) -> np.nda
         np.cbrt(np.maximum(ratio, 0.0)),
         ratio / (3 * (6 / 29) ** 2) + 4 / 29,
     )
-    x, y, z = transformed
-    return np.array([116 * y - 16, 500 * (x - y), 200 * (y - z)])
+    x, y, z = (transformed[..., index] for index in range(3))
+    return np.stack([116 * y - 16, 500 * (x - y), 200 * (y - z)], axis=-1)
 
 
 def lab_to_xyz(lab: np.ndarray, white_point: np.ndarray | None = None) -> np.ndarray:
-    """CIE XYZ from CIELAB -- the inverse of :func:`xyz_to_lab`."""
+    """CIE XYZ from CIELAB -- the inverse of :func:`xyz_to_lab`, one colour or a stack."""
     white_point = D65_WHITE_POINT_XYZ if white_point is None else white_point
-    lightness, green_red, blue_yellow = (float(v) for v in np.asarray(lab, dtype=float))
+    lab = np.asarray(lab, dtype=float)
+    lightness, green_red, blue_yellow = (lab[..., index] for index in range(3))
 
     y = (lightness + 16) / 116
     x = y + green_red / 500
     z = y - blue_yellow / 200
 
     linear_segment_limit = 6 / 29
-    ratios = np.array([x, y, z])
+    ratios = np.stack([x, y, z], axis=-1)
     return (
         np.where(
             ratios > linear_segment_limit,

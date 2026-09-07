@@ -25,6 +25,9 @@ from .colorimetry import (
     spectrum_to_srgb,
     srgb_to_hex,
     srgb_to_lab,
+    srgb_to_xyz,
+    xyz_to_lab,
+    xyz_to_srgb,
 )
 from .kubelka_munk import (
     absorption_over_scattering,
@@ -63,4 +66,7 @@ __all__ = [
     "spectrum_to_srgb",
     "srgb_to_hex",
     "srgb_to_lab",
+    "srgb_to_xyz",
+    "xyz_to_lab",
+    "xyz_to_srgb",
 ]

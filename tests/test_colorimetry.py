@@ -107,3 +107,27 @@ def test_lab_converts_back_to_the_colour_it_came_from(colour):
     from kubelka_munk import lab_to_srgb
 
     assert srgb_to_hex(lab_to_srgb(srgb_to_lab(hex_to_srgb(colour)))) == colour
+
+
+def test_colour_conversions_work_on_a_whole_stack_at_once():
+    """An image is millions of colours; converting them one at a time is not an option.
+
+    Every conversion takes the three components on the last axis, so a stack of any
+    shape goes through in one call and must agree with the colours done singly.
+    """
+    from kubelka_munk import lab_to_xyz
+
+    colours = np.array(
+        [hex_to_srgb(c) for c in ("#000000", "#ffffff", "#1f3a93", "#6b8e23", "#c08040")]
+    )
+
+    stacked = xyz_to_lab(srgb_to_xyz(colours))
+    assert stacked.shape == colours.shape
+    for index, colour in enumerate(colours):
+        assert stacked[index] == pytest.approx(xyz_to_lab(srgb_to_xyz(colour)))
+
+    assert xyz_to_srgb(lab_to_xyz(stacked)) == pytest.approx(colours, abs=1e-9)
+
+    # Shape is preserved, so an image-shaped array works without reshaping.
+    image = colours.reshape(1, 5, 3)
+    assert xyz_to_lab(srgb_to_xyz(image)).shape == (1, 5, 3)
