@@ -52,6 +52,13 @@ ZORN_HUES = [
 # single colour -- there is nothing lighter to tint it with.
 TITANIUM_WHITE = ("Titanium White", "#fbfaf6", 10.0)
 
+# Not a Zorn colour, and offered separately for that reason. Zorn's four have no blue in
+# them at all, which is why a sky or a sea painted with them comes out a warm grey, and
+# adding one is the obvious thing to try when that is the failure you are looking at.
+# Prussian blue is a famously powerful tinter -- a little of it goes a very long way,
+# which the strong scattering recovered from this tint reflects.
+PRUSSIAN_BLUE = ("Prussian Blue", "#10263a", "#7d9aad")
+
 # How pale the outermost ring gets. Titanium white scatters so strongly that going much
 # beyond this washes every hue out to the same near-white.
 MOST_WHITE = 0.75
@@ -282,8 +289,12 @@ def write_svg(
         handle.write("\n".join(parts))
 
 
-def build_palette() -> Palette:
-    """The four Zorn paints: three calibrated from masstone and tint, plus the white."""
+def build_palette(extra_hues: list[tuple[str, str, str]] = ()) -> Palette:
+    """The four Zorn paints -- three calibrated from masstone and tint, plus the white.
+
+    ``extra_hues`` takes further paints in the same form, for asking what a palette Zorn
+    did not use would have done. :data:`PRUSSIAN_BLUE` is one.
+    """
     white = Paint.from_srgb(*TITANIUM_WHITE[:2], tinting_strength=TITANIUM_WHITE[2])
 
     hues = [
@@ -294,7 +305,7 @@ def build_palette() -> Palette:
             white=white,
             tint_fraction=TINT_FRACTION,
         )
-        for name, masstone, tint in ZORN_HUES
+        for name, masstone, tint in [*ZORN_HUES, *extra_hues]
     ]
     return Palette([*hues, white])
 

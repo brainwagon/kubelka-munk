@@ -37,7 +37,7 @@ from scipy.spatial import cKDTree
 
 from kubelka_munk import decode_srgb, srgb_to_xyz, xyz_to_lab
 from kubelka_munk.colorimetry import LINEAR_SRGB_TO_XYZ
-from zorn_wheel import add_tints, build_hues, build_palette, ZORN_HUES
+from zorn_wheel import add_tints, build_hues, build_palette, PRUSSIAN_BLUE
 
 # A denser wheel than the one drawn on screen: an image needs somewhere to put every
 # pixel, so it wants more hues and, especially, more steps of value -- skin is mostly a
@@ -61,7 +61,9 @@ def build_chit_colours(palette) -> tuple[np.ndarray, list[np.ndarray]]:
     Returns the colours as an (n, 3) array and the matching weight vectors, so a pixel's
     nearest colour can be traced back to the paint that produced it.
     """
-    hues = build_hues(len(ZORN_HUES), HUE_ROUNDS)
+    # Every paint on the palette but the white, which is the tinting axis rather than a
+    # point on the wheel.
+    hues = build_hues(len(palette) - 1, HUE_ROUNDS)
     chits = add_tints(hues, TINT_STEPS, most_white=MOST_WHITE)
 
     weights = [chit.weights for chit in chits]
@@ -258,6 +260,7 @@ def main(
     destination: str | None = None,
     mixtures: int | None = None,
     dither: bool = False,
+    blue: bool = False,
 ) -> None:
     source_path = Path(source)
     destination_path = (
@@ -269,7 +272,7 @@ def main(
     image = np.asarray(Image.open(source_path).convert("RGB"), dtype=float) / 255.0
     print(f"\n  {source_path.name}: {image.shape[1]} x {image.shape[0]}")
 
-    palette = build_palette()
+    palette = build_palette([PRUSSIAN_BLUE] if blue else [])
     chit_colours, weights = build_chit_colours(palette)
 
     if mixtures is not None:
@@ -304,6 +307,12 @@ if __name__ == "__main__":
         "(default: every mixture on the wheel)",
     )
     parser.add_argument(
+        "-b",
+        "--blue",
+        action="store_true",
+        help="add Prussian blue to the palette, which Zorn's four have no answer for",
+    )
+    parser.add_argument(
         "-d",
         "--dither",
         action="store_true",
@@ -312,5 +321,9 @@ if __name__ == "__main__":
     )
     arguments = parser.parse_args()
     main(
-        arguments.source, arguments.destination, arguments.mixtures, arguments.dither
+        arguments.source,
+        arguments.destination,
+        arguments.mixtures,
+        arguments.dither,
+        arguments.blue,
     )

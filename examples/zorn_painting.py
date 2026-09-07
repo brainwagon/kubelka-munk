@@ -57,7 +57,7 @@ from scipy.spatial import cKDTree
 
 from kubelka_munk import srgb_to_xyz, xyz_to_lab
 from zorn_filter import build_chit_colours, choose_best_mixtures
-from zorn_wheel import build_palette
+from zorn_wheel import PRUSSIAN_BLUE, build_palette
 
 # Brush widths in pixels, coarsest first. Each is half the last, which is what makes the
 # picture arrive as successive refinements rather than as one flat pass.
@@ -907,6 +907,7 @@ def main(
     tightness: float = DEFAULT_TIGHTNESS,
     separate: bool = False,
     background_tightness: float | None = None,
+    blue: bool = False,
 ) -> None:
     source_path = Path(source)
     destination_path = (
@@ -943,7 +944,7 @@ def main(
             f"painted at tightness {looser:.2f}"
         )
 
-    palette = build_palette()
+    palette = build_palette([PRUSSIAN_BLUE] if blue else [])
     palette_colours, weights = build_chit_colours(palette)
     if mixtures is not None:
         keep = choose_best_mixtures(image, palette_colours, mixtures)
@@ -1022,6 +1023,12 @@ if __name__ == "__main__":
         help="override the colour jitter the tightness would choose (0 to disable)",
     )
     parser.add_argument(
+        "-b",
+        "--blue",
+        action="store_true",
+        help="add Prussian blue to the palette, which Zorn's four have no answer for",
+    )
+    parser.add_argument(
         "-s",
         "--separate",
         action="store_true",
@@ -1067,4 +1074,5 @@ if __name__ == "__main__":
         arguments.tightness,
         arguments.separate,
         arguments.background_tightness,
+        arguments.blue,
     )
