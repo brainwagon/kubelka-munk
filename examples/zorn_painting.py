@@ -51,7 +51,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
-from scipy.ndimage import gaussian_filter, sobel
+from scipy.ndimage import gaussian_filter, sobel, zoom
 from scipy.spatial import cKDTree
 
 from kubelka_munk import srgb_to_xyz, xyz_to_lab
@@ -85,7 +85,21 @@ CURVATURE = 0.25
 # and where a painter would lay calm parallel strokes rather than squiggles.
 COHERENCE_FLOOR = 0.15
 COHERENCE_CEILING = 0.5
+
+# Where the picture has no opinion about direction, the strokes hatch at this angle --
+# but not all at exactly this angle. One fixed direction across a whole canvas is a
+# rendering convention showing through; a painter's hatching wanders with the form and
+# with the reach of their arm. So the angle drifts by up to this much over the picture,
+# smoothly, on a scale of a few hundred pixels.
 FALLBACK_ANGLE = 40.0
+FALLBACK_DRIFT = 25.0
+FALLBACK_SCALE = 220.0
+
+# How confident the orientation has to be before a stroke follows it rather than hatching.
+# This is a threshold rather than a blend on purpose: blending a measured direction
+# towards the hatching angle produces directions that are neither, and biases the whole
+# picture towards the diagonal.
+TRUST_TO_FOLLOW = 0.5
 
 # Coherence is a ratio of eigenvalues, so it is blind to scale: the faintest imaginable
 # texture, if consistently oriented, scores as highly as a clean edge. A blown-out sky is
@@ -155,6 +169,7 @@ def paint(
     seed: int = 0,
     jitter: float = COLOUR_JITTER,
     recorder: "Recorder | None" = None,
+    fallback_angle: float = FALLBACK_ANGLE,
 ) -> Image.Image:
     """Work from the coarsest brush to the finest, refining what the last one missed."""
     radii = BRUSH_RADII if radii is None else radii
@@ -162,6 +177,10 @@ def paint(
     generator = np.random.default_rng(seed)
 
     snap = _palette_snapper(palette_colours)
+
+    # One hatching field for the whole painting, so every layer agrees about which way to
+    # lay paint where the picture does not say.
+    hatching = _hatching_field((height, width), fallback_angle, generator)
 
     # Start from the picture's average colour, so that anywhere the brushes never visit
     # still reads as part of the painting rather than as a hole.
@@ -201,7 +220,7 @@ def paint(
     for (radius, reference, strokes), frames in zip(planned, budget):
         _draw_layer(
             canvas, relief, strokes, reference, radius, snap, generator, jitter,
-            recorder, frames,
+            hatching, recorder, frames,
         )
         print(f"    brush {radius:3d}px  {len(strokes):6d} strokes")
 
@@ -264,7 +283,28 @@ def _plan_frames(counts: list[int], total: int) -> list[int]:
     return [max(1, round(weight * scale)) for weight in weights]
 
 
-def _orientation_field(reference: np.ndarray, radius: int) -> np.ndarray:
+def _hatching_field(
+    shape: tuple[int, int], angle: float, generator
+) -> np.ndarray:
+    """The direction to hatch in where the picture has nothing to say, as a field.
+
+    A single angle everywhere reads as machinery. This wanders slowly across the canvas
+    instead, by smoothing noise down to a very low frequency so that neighbouring strokes
+    still agree while opposite corners of the picture need not.
+    """
+    height, width = shape
+    coarse = generator.normal(size=(max(2, height // 64), max(2, width // 64)))
+    spread = zoom(coarse, (height / coarse.shape[0], width / coarse.shape[1]), order=1)
+    spread = gaussian_filter(spread[:height, :width], FALLBACK_SCALE)
+    spread = spread / max(np.abs(spread).max(), 1e-9)
+
+    angles = np.radians(angle + FALLBACK_DRIFT * spread)
+    return np.stack([np.cos(angles), np.sin(angles)], axis=-1)
+
+
+def _orientation_field(
+    reference: np.ndarray, radius: int, hatching: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """Which way the strokes should run, everywhere, as a field of unit vectors.
 
     Taking the gradient at a point and turning ninety degrees gives a direction, but a
@@ -280,13 +320,18 @@ def _orientation_field(reference: np.ndarray, radius: int) -> np.ndarray:
     It also yields a confidence for free. The gap between the two eigenvalues, relative to
     their sum, says how strongly oriented a neighbourhood really is. Where that is small
     the image has no opinion, and imposing one produces the scribble this replaces, so
-    those regions are handed a single common direction instead.
+    those regions are handed the hatching direction instead.
 
     That ratio is scale-blind, though, and will happily report a confident direction for
     texture far too faint to see. So it is multiplied by the gradient energy, judged
     against the energy of the surrounding neighbourhood: a region must be both
     consistently oriented *and* have more going on than its surroundings before the
     strokes will follow it.
+
+    The tangents and the confidence are returned separately rather than blended together.
+    Blending them rotates every middling-confidence direction towards the hatching angle,
+    which quietly tilts the whole picture; the caller uses the confidence to *choose*
+    instead.
     """
     luminance = reference @ np.array([0.2126, 0.7152, 0.0722])
     gradient_x = sobel(luminance, axis=1)
@@ -314,23 +359,20 @@ def _orientation_field(reference: np.ndarray, radius: int) -> np.ndarray:
     angle = 0.5 * np.arctan2(2.0 * xy, difference)
     tangent = np.stack([-np.sin(angle), np.cos(angle)], axis=-1)
 
-    fallback = np.array(
-        [np.cos(np.radians(FALLBACK_ANGLE)), np.sin(np.radians(FALLBACK_ANGLE))]
+    # A tangent has no inherent sign, so point them all the same way as the local
+    # hatching. This alone stops neighbouring strokes running head-on into each other.
+    facing = np.sign(np.sum(tangent * hatching, axis=-1))
+    tangent = tangent * np.where(facing == 0, 1.0, facing)[..., np.newaxis]
+
+    trust = (
+        np.clip(
+            (coherence - COHERENCE_FLOOR) / (COHERENCE_CEILING - COHERENCE_FLOOR),
+            0.0,
+            1.0,
+        )
+        * energy
     )
-
-    # A tangent has no inherent sign, so point them all the same way. This alone stops
-    # neighbouring strokes running head-on into each other.
-    facing = np.sign(tangent @ fallback)
-    tangent *= np.where(facing == 0, 1.0, facing)[..., np.newaxis]
-
-    trust = np.clip(
-        (coherence - COHERENCE_FLOOR) / (COHERENCE_CEILING - COHERENCE_FLOOR), 0.0, 1.0
-    )
-    trust = (trust * energy)[..., np.newaxis]
-    field = trust * tangent + (1.0 - trust) * fallback
-
-    length = np.linalg.norm(field, axis=-1, keepdims=True)
-    return field / np.maximum(length, 1e-9)
+    return tangent, trust
 
 
 def _plan_layer(
@@ -388,14 +430,14 @@ def _preview_layer(canvas, reference, strokes, radius):
 
 
 def _draw_layer(
-    canvas, height, strokes, reference, radius, snap, generator, jitter,
+    canvas, height, strokes, reference, radius, snap, generator, jitter, hatching,
     recorder=None, frames=0,
 ) -> None:
     """Trace and paint every stroke of one layer, and record how thick the paint got."""
     brush = ImageDraw.Draw(canvas)
     relief = ImageDraw.Draw(height)
 
-    field = _orientation_field(reference, radius)
+    tangent, trust = _orientation_field(reference, radius, hatching)
     reference_lab = xyz_to_lab(srgb_to_xyz(reference))
 
     columns = np.array([x for x, _ in strokes])
@@ -419,7 +461,7 @@ def _draw_layer(
 
     for index, (x, y) in enumerate(strokes):
         points = _trace_stroke(
-            x, y, radius, field, reference_lab, loaded[index]
+            x, y, radius, tangent, hatching, trust, reference_lab, loaded[index]
         )
         width = radius * widths[index]
         tracks = _bristle_tracks(points, width, generator)
@@ -469,17 +511,24 @@ def _trace_stroke(
     x: int,
     y: int,
     radius: int,
-    field: np.ndarray,
+    tangent: np.ndarray,
+    hatching: np.ndarray,
+    trust: np.ndarray,
     reference_lab: np.ndarray,
     started_from: np.ndarray,
 ) -> list[tuple[float, float]]:
-    """Follow the orientation field from a starting point.
+    """Follow the picture from a starting point, as far as the picture is worth following.
 
-    The stroke stops when it leaves the picture, or when it reaches somewhere whose
-    colour no longer matches the colour the brush is loaded with -- a stroke should stay
-    inside the form it began in.
+    Confidence decides how readily the stroke *turns*, rather than what direction it
+    points in. Where the orientation is trustworthy the stroke steers by it; where it is
+    not, the stroke simply carries on the way it was already going. A brush behaves like
+    this -- it travels, and the picture steers it more or less firmly -- and it means a
+    passage with no direction in it gets straight strokes rather than strokes bent
+    towards some house angle.
+
+    The starting direction is chosen, not blended, for the same reason.
     """
-    height, width, _ = field.shape
+    height, width, _ = tangent.shape
     points = [(float(x), float(y))]
     position = np.array([float(x), float(y)])
     last_direction = np.zeros(2)
@@ -494,12 +543,20 @@ def _trace_stroke(
             if drifted > STROKE_TOLERANCE:
                 break
 
-        direction = field[row, column]
-        if direction @ last_direction < 0:
-            direction = -direction
+        confidence = trust[row, column]
+        if step == 0:
+            direction = (
+                tangent[row, column]
+                if confidence >= TRUST_TO_FOLLOW
+                else hatching[row, column]
+            )
+        else:
+            guide = tangent[row, column]
+            if guide @ last_direction < 0:
+                guide = -guide
 
-        if step > 0:
-            direction = CURVATURE * direction + (1 - CURVATURE) * last_direction
+            turn = CURVATURE * confidence
+            direction = turn * guide + (1.0 - turn) * last_direction
             length = np.linalg.norm(direction)
             if length < 1e-9:
                 break
@@ -619,6 +676,7 @@ def main(
     radii: list[int] | None = None,
     jitter: float = COLOUR_JITTER,
     video: str | None = None,
+    fallback_angle: float = FALLBACK_ANGLE,
 ) -> None:
     source_path = Path(source)
     destination_path = (
@@ -654,7 +712,13 @@ def main(
         print(f"  recording {VIDEO_SECONDS:.0f}s at {VIDEO_FPS}fps to {video_path}")
 
     painting = paint(
-        image, palette_colours, radii=radii, seed=seed, jitter=jitter, recorder=recorder
+        image,
+        palette_colours,
+        radii=radii,
+        seed=seed,
+        jitter=jitter,
+        recorder=recorder,
+        fallback_angle=fallback_angle,
     )
     painting.save(destination_path)
 
@@ -701,6 +765,13 @@ if __name__ == "__main__":
         "mixture (default %(default)s, 0 to disable)",
     )
     parser.add_argument(
+        "--fallback-angle",
+        type=float,
+        default=FALLBACK_ANGLE,
+        help=f"degrees to hatch at where the picture has no direction of its own "
+        f"(default %(default)s, drifting by up to {FALLBACK_DRIFT:.0f} across the canvas)",
+    )
+    parser.add_argument(
         "--video",
         metavar="FILE.mp4",
         help=f"also record the painting being made, about {VIDEO_SECONDS:.0f} seconds long "
@@ -722,4 +793,5 @@ if __name__ == "__main__":
         [int(radius) for radius in arguments.brushes.split(",")],
         arguments.jitter,
         arguments.video,
+        arguments.fallback_angle,
     )
