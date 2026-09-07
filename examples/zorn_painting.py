@@ -233,17 +233,50 @@ def paint(
             if paintable is None
             else Image.fromarray((paintable * 255).astype(np.uint8), "L")
         )
-        for radius in pass_style.brushes(radii or BRUSH_RADII):
+
+        # A stencilled pass starts from a ground of its own rather than from whatever is
+        # already on the canvas underneath it. Otherwise it repaints only where the
+        # painting below happens to differ enough, and wherever the background behind him
+        # came out close to his skin -- which over a pale sky is much of a forehead -- the
+        # subject never gets painted and the background's brushwork stays showing through
+        # his face.
+        #
+        # The ground is a very soft block-in of the pass's own subject, not one flat tone.
+        # A single tone is the average of everything in the pass, which here means a
+        # yellow shirt two thirds of the way to a face, and it shows as ochre in every gap
+        # the strokes leave. A blurred underpainting leaves gaps that are the right colour
+        # to begin with.
+        brushes = pass_style.brushes(radii or BRUSH_RADII)
+        ground = None
+        if stencil is not None:
+            blocked_in = gaussian_filter(
+                subject, sigma=(2.0 * brushes[0], 2.0 * brushes[0], 0)
+            )
+            ground = Image.fromarray(
+                snap(xyz_to_lab(srgb_to_xyz(blocked_in)).reshape(-1, 3)).reshape(
+                    height, width, 3
+                )
+            )
+
+        surface = scratch if ground is None else ground.copy()
+        for radius in brushes:
             reference = gaussian_filter(
                 subject, sigma=(BLUR_PER_RADIUS * radius, BLUR_PER_RADIUS * radius, 0)
             )
             strokes = _plan_layer(
-                np.asarray(scratch) / 255.0, reference, radius, pass_style, paintable
+                np.asarray(surface) / 255.0, reference, radius, pass_style, paintable
             )
             generator.shuffle(strokes)
-            plans.append((label, stencil, pass_style, radius, reference, strokes))
+            plans.append(
+                (label, stencil, ground, pass_style, radius, reference, strokes)
+            )
             # A rough stand-in for what the layer will do, good enough to plan the next.
-            scratch = _preview_layer(scratch, reference, strokes, radius, stencil)
+            surface = _preview_layer(surface, reference, strokes, radius)
+
+        if stencil is None:
+            scratch = surface
+        else:
+            scratch.paste(surface, (0, 0), stencil)
 
     budget = (
         _plan_frames(
@@ -258,26 +291,27 @@ def paint(
         recorder.frame(canvas, relief)
 
     painted, painted_relief, mask, current = canvas, relief, None, None
-    for (label, region_mask, pass_style, radius, reference, strokes), frames in zip(
+    for (label, stencil, ground, pass_style, radius, reference, strokes), frames in zip(
         plans, budget
     ):
         if label != current:
             _stencil(canvas, relief, painted, painted_relief, mask)
-            mask = region_mask
-            # A masked pass is painted on its own copy and stencilled on afterwards, so
-            # that its strokes cannot spill out past the silhouette.
-            painted = canvas.copy() if mask is not None else canvas
-            painted_relief = relief.copy() if mask is not None else relief
+            mask = stencil
+            if mask is None:
+                painted, painted_relief = canvas, relief
+            else:
+                painted = ground.copy()
+                painted_relief = Image.new("L", (width, height), 128)
             current = label
 
-        def capture(surface=painted, surface_relief=painted_relief, stencil=mask):
+        def capture(surface=painted, surface_relief=painted_relief, cut=mask):
             """The painting as it would look if the pass in progress stopped here."""
-            if stencil is None:
+            if cut is None:
                 recorder.frame(surface, surface_relief)
             else:
                 preview, preview_relief = canvas.copy(), relief.copy()
-                preview.paste(surface, (0, 0), stencil)
-                preview_relief.paste(surface_relief, (0, 0), stencil)
+                preview.paste(surface, (0, 0), cut)
+                preview_relief.paste(surface_relief, (0, 0), cut)
                 recorder.frame(preview, preview_relief)
 
         _draw_layer(
