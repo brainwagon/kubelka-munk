@@ -156,6 +156,12 @@ BACKGROUND_LOOSER_BY = 0.25
 INPAINT_SMOOTHING = 9.0
 INPAINT_RELAXATIONS = 12
 
+# How far the repaint threshold is allowed to swing between the flattest and the most
+# detailed parts of a picture, at full smoothness. Applied as a ratio either side, so a
+# range of 4 means a featureless cheek needs four times the error before it is gone over
+# again, while an eyelid needs a quarter of it.
+DETAIL_RANGE = 4.0
+
 # The one dial for how tightly the painting follows the photograph. Half way reproduces
 # the settings these were tuned to by hand; see Style below for what it moves.
 DEFAULT_TIGHTNESS = 0.5
@@ -366,9 +372,10 @@ class Style:
     stroke_tolerance: float
     jitter: float
     brush_scale: float
+    smoothness: float = 0.0
 
     @classmethod
-    def from_tightness(cls, tightness: float) -> "Style":
+    def from_tightness(cls, tightness: float, smoothness: float = 0.0) -> "Style":
         tightness = float(np.clip(tightness, 0.0, 1.0))
 
         def between(loose: float, tight: float) -> float:
@@ -385,6 +392,8 @@ class Style:
             jitter=between(8.0, 2.5),
             # And how big the brushes are, against the sizes named in BRUSH_RADII.
             brush_scale=between(1.5, 0.65),
+            # Independent of tightness: this decides how unevenly the tightness is spent.
+            smoothness=float(np.clip(smoothness, 0.0, 1.0)),
         )
 
     def brushes(self, radii: list[int]) -> list[int]:
@@ -392,10 +401,15 @@ class Style:
         return [max(2, round(radius * self.brush_scale)) for radius in radii]
 
     def describe(self) -> str:
+        spent = (
+            ""
+            if not self.smoothness
+            else f", detail bias {self.smoothness:.2f}"
+        )
         return (
             f"brushes {self.brushes(BRUSH_RADII)}, repaint over "
             f"{self.repaint_threshold:.1f}, stroke <= {self.maximum_stroke}, "
-            f"tolerance {self.stroke_tolerance:.0f}, jitter {self.jitter:.1f}"
+            f"tolerance {self.stroke_tolerance:.0f}, jitter {self.jitter:.1f}{spent}"
         )
 
 
@@ -586,6 +600,23 @@ def _orientation_field(
     return tangent, trust
 
 
+def _detail(reference: np.ndarray, radius: int) -> np.ndarray:
+    """How much there is worth resolving at each point, from 0 to 1.
+
+    Deliberately an *absolute* measure of edge strength, judged against the strong
+    gradients of the picture as a whole, and not a local one. Asking whether a
+    neighbourhood is more detailed than its surroundings gives the wrong answer here: a
+    uniformly detailed region and a uniformly flat one both come out the same, and on this
+    photograph that ranked a pair of spectacles below a bare cheek. The question is not
+    whether there is more detail here than next door, it is whether there is any detail
+    here at all.
+    """
+    luminance = reference @ np.array([0.2126, 0.7152, 0.0722])
+    edges = np.hypot(sobel(luminance, axis=1), sobel(luminance, axis=0))
+    edges = gaussian_filter(edges, max(1.0, radius / 2))
+    return np.clip(edges / max(np.percentile(edges, 90), 1e-9), 0.0, 1.0)
+
+
 def _plan_layer(
     canvas: np.ndarray,
     reference: np.ndarray,
@@ -601,6 +632,16 @@ def _plan_layer(
     difference = np.linalg.norm(
         xyz_to_lab(srgb_to_xyz(canvas)) - xyz_to_lab(srgb_to_xyz(reference)), axis=-1
     )
+
+    if style.smoothness:
+        # Spend the effort where there is something to resolve. Skin is smooth and an
+        # eyelid is not, but a uniform threshold cannot tell them apart, so raising the
+        # tightness to sharpen the spectacles also stipples the cheek. Weighting the
+        # error by how much detail is actually present buys one without the other.
+        detail = _detail(reference, radius)
+        difference = difference * DETAIL_RANGE ** (
+            style.smoothness * (2.0 * detail - 1.0)
+        )
 
     if region is not None:
         # Outside this pass's region there is nothing to answer for, so a cell straddling
@@ -674,7 +715,18 @@ def _draw_layer(
     loaded = reference_lab[rows, columns]
     nudged = np.repeat(loaded[:, np.newaxis, :], BRISTLES, axis=1)
     if jitter:
-        nudged = nudged + generator.normal(0.0, jitter, size=nudged.shape)
+        nudge = generator.normal(0.0, jitter, size=nudged.shape)
+        if style.smoothness:
+            # Broken colour is what makes a passage look painted, but on a cheek it is
+            # also exactly what makes it look blotchy -- neighbouring strokes of slightly
+            # different mixtures read as mottling where skin should be smooth. So the
+            # nudge is spent where the picture is busy enough to carry it and withheld
+            # where nothing is going on. Placing fewer strokes does not smooth skin by
+            # itself, because the ones that remain still vary; this is what does it.
+            wanted = _detail(reference, radius)[rows, columns]
+            keep = (1.0 - style.smoothness) + style.smoothness * wanted
+            nudge = nudge * keep[:, np.newaxis, np.newaxis]
+        nudged = nudged + nudge
     colours = snap(nudged.reshape(-1, 3)).reshape(len(strokes), BRISTLES, 3)
 
     # How thickly each stroke is loaded. Varying it is what gives the lit height field
@@ -905,6 +957,7 @@ def main(
     video: str | None = None,
     fallback_angle: float = FALLBACK_ANGLE,
     tightness: float = DEFAULT_TIGHTNESS,
+    smoothness: float = 0.0,
     separate: bool = False,
     background_tightness: float | None = None,
     blue: bool = False,
@@ -927,7 +980,7 @@ def main(
     image = np.asarray(original, dtype=float) / 255.0
     print(f"\n  {source_path.name}: painting at {image.shape[1]} x {image.shape[0]}")
 
-    style = Style.from_tightness(tightness)
+    style = Style.from_tightness(tightness, smoothness)
     print(f"  tightness {tightness:.2f}: {style.describe()}")
 
     foreground, background_style = None, None
@@ -938,7 +991,7 @@ def main(
             if background_tightness is None
             else background_tightness
         )
-        background_style = Style.from_tightness(looser)
+        background_style = Style.from_tightness(looser, smoothness)
         print(
             f"  subject covers {foreground.mean():.0%} of the picture; background "
             f"painted at tightness {looser:.2f}"
@@ -1023,6 +1076,14 @@ if __name__ == "__main__":
         help="override the colour jitter the tightness would choose (0 to disable)",
     )
     parser.add_argument(
+        "--smoothness",
+        type=float,
+        default=0.0,
+        help="spend the detail unevenly, from 0 for the same everywhere to 1 for as much "
+        "as possible on edges and as little as possible on flat areas. Smooths skin while "
+        "keeping spectacles and eyelids sharp (default %(default)s)",
+    )
+    parser.add_argument(
         "-b",
         "--blue",
         action="store_true",
@@ -1072,6 +1133,7 @@ if __name__ == "__main__":
         arguments.video,
         arguments.fallback_angle,
         arguments.tightness,
+        arguments.smoothness,
         arguments.separate,
         arguments.background_tightness,
         arguments.blue,
