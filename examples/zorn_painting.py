@@ -15,9 +15,25 @@ Each layer works like this:
      of the brush. Where a cell is close enough already, leave it alone -- this is what
      stops small brushes from stippling flat areas of sky.
   3. Everywhere else, start a stroke at the worst pixel in the cell.
-  4. Grow the stroke along the direction the image is *not* changing -- perpendicular to
-     its gradient -- so strokes run along edges and around forms rather than across them.
-     Stop when the stroke wanders somewhere it no longer belongs.
+  4. Grow the stroke along the direction the image is *not* changing, so strokes run
+     along edges and around forms rather than across them. Stop when the stroke wanders
+     somewhere it no longer belongs.
+
+Three things separate this from the same algorithm drawing coloured worms.
+
+The direction a stroke travels comes from a *structure tensor*, not from the raw gradient.
+The gradient at a point is noisy, flips sign across a ridge, and in a flat region says
+whatever the noise says; strokes built on it wiggle constantly. The structure tensor
+averages the gradient's outer product over a neighbourhood, which is stable, and it
+reports how much it should be believed, so flat passages can be given calm parallel
+strokes instead of squiggles.
+
+A mark is drawn as several tapered bristle tracks rather than one constant-width band
+with a round cap, which is the shape a mouse makes.
+
+And the paint is given thickness. Strokes accumulate into a height field which is lit
+from the side at the end, so the ridge along each stroke catches the light. That is most
+of what tells the eye it is looking at paint rather than at a picture of a colour.
 
 Stroke colours are snapped to mixtures of the four Zorn paints, so the result is a
 picture that could in principle be painted with four tubes. Pass ``--mixtures N`` to
@@ -54,11 +70,48 @@ REPAINT_THRESHOLD = 8.0
 
 # Stroke lengths, in brush radii.
 MINIMUM_STROKE = 4
-MAXIMUM_STROKE = 16
+MAXIMUM_STROKE = 12
 
-# How readily a stroke changes direction: 1 follows the image gradient exactly and gives
-# jittery strokes, 0 never turns at all. This is Hertzmann's curvature filter.
-CURVATURE = 0.4
+# How readily a stroke changes direction: 1 follows the orientation field exactly, 0 never
+# turns at all. This is Hertzmann's curvature filter, kept low because a stroke that can
+# turn freely at every step wanders instead of travelling.
+CURVATURE = 0.25
+
+# Below this coherence -- how strongly oriented the picture is at a point, 0 for a flat
+# region and 1 for a clean edge -- strokes stop following the image and fall back to a
+# common direction. Flat passages are exactly where the orientation is meaningless noise,
+# and where a painter would lay calm parallel strokes rather than squiggles.
+COHERENCE_FLOOR = 0.15
+COHERENCE_CEILING = 0.5
+FALLBACK_ANGLE = 40.0
+
+# Coherence is a ratio of eigenvalues, so it is blind to scale: the faintest imaginable
+# texture, if consistently oriented, scores as highly as a clean edge. A blown-out sky is
+# full of such texture, and following it produces swirls in what should be calm paint.
+# So the field is trusted only where there is real contrast as well.
+#
+# That contrast has to be judged locally, not against the picture as a whole. A face is
+# far lower in contrast than a row of buildings behind it, so any single global threshold
+# either follows the buildings and hatches the face flat, or follows the face and turns
+# the sky into swirls. Comparing each point against the average energy of its own
+# neighbourhood separates them cleanly -- on this photograph, blown sky scores 0.00, a
+# flat cheek 0.16, and eyes and brows 0.69, despite the last being a tenth the contrast
+# of the buildings.
+ENERGY_NEIGHBOURHOOD = 12.0
+ENERGY_FLOOR = 0.5
+
+# A mark is drawn as several parallel bristle tracks rather than one solid band, tapering
+# towards the end as the brush lifts. This is most of what separates a brush from a marker.
+BRISTLES = 3
+BRISTLE_SPREAD = 0.8
+TAPER_TO = 0.35
+WIDTH_VARIATION = (0.75, 1.15)
+
+# Paint stands off the canvas and its ridges catch the light. Strokes accumulate into a
+# height field which is then lit from the upper left.
+IMPASTO_STRENGTH = 1.6
+IMPASTO_BLUR = 1.1
+LIGHT_FROM = (-0.7071, -0.7071)
 
 # How far a stroke's colour may wander from the palette mixture it started with before it
 # is cut short, in units of colour difference.
@@ -87,8 +140,12 @@ def paint(
 
     # Start from the picture's average colour, so that anywhere the brushes never visit
     # still reads as part of the painting rather than as a hole.
-    average = xyz_to_lab(srgb_to_xyz(image.mean(axis=(0, 1))))
-    canvas = Image.new("RGB", (width, height), snap(average))
+    average = snap(xyz_to_lab(srgb_to_xyz(image.mean(axis=(0, 1))))[np.newaxis])[0]
+    canvas = Image.new("RGB", (width, height), tuple(average.tolist()))
+
+    # How thick the paint is, everywhere. Later strokes overwrite earlier ones, which is
+    # what paint does.
+    relief = Image.new("L", (width, height), 128)
 
     for radius in radii:
         reference = gaussian_filter(
@@ -97,10 +154,81 @@ def paint(
         strokes = _plan_layer(np.asarray(canvas) / 255.0, reference, radius)
         generator.shuffle(strokes)
 
-        _draw_layer(canvas, strokes, reference, radius, snap, generator, jitter)
+        _draw_layer(
+            canvas, relief, strokes, reference, radius, snap, generator, jitter
+        )
         print(f"    brush {radius:3d}px  {len(strokes):6d} strokes")
 
-    return canvas
+    return _apply_impasto(canvas, relief)
+
+
+def _orientation_field(reference: np.ndarray, radius: int) -> np.ndarray:
+    """Which way the strokes should run, everywhere, as a field of unit vectors.
+
+    Taking the gradient at a point and turning ninety degrees gives a direction, but a
+    noisy one: it flips sign across a ridge, and in a flat region it is whatever the
+    noise happens to say. Strokes built from it wander.
+
+    The structure tensor fixes this. It is the outer product of the gradient with itself,
+    averaged over a neighbourhood -- and because it is the *tensor* that gets averaged
+    rather than the angles, opposing gradients reinforce instead of cancelling. Its minor
+    eigenvector is the direction along which the picture changes least, which is the
+    direction a stroke should travel: along an edge rather than across it.
+
+    It also yields a confidence for free. The gap between the two eigenvalues, relative to
+    their sum, says how strongly oriented a neighbourhood really is. Where that is small
+    the image has no opinion, and imposing one produces the scribble this replaces, so
+    those regions are handed a single common direction instead.
+
+    That ratio is scale-blind, though, and will happily report a confident direction for
+    texture far too faint to see. So it is multiplied by the gradient energy, judged
+    against the energy of the surrounding neighbourhood: a region must be both
+    consistently oriented *and* have more going on than its surroundings before the
+    strokes will follow it.
+    """
+    luminance = reference @ np.array([0.2126, 0.7152, 0.0722])
+    gradient_x = sobel(luminance, axis=1)
+    gradient_y = sobel(luminance, axis=0)
+
+    spread = max(1.5, float(radius))
+    xx = gaussian_filter(gradient_x * gradient_x, spread)
+    xy = gaussian_filter(gradient_x * gradient_y, spread)
+    yy = gaussian_filter(gradient_y * gradient_y, spread)
+
+    difference = xx - yy
+    root = np.sqrt(difference * difference + 4.0 * xy * xy)
+    total = xx + yy
+    coherence = np.divide(root, total, out=np.zeros_like(root), where=total > 1e-12)
+
+    # ...and how much contrast there is to be coherent about.
+    neighbourhood = gaussian_filter(
+        total, min(ENERGY_NEIGHBOURHOOD * radius, 200.0)
+    )
+    energy = np.clip(
+        total / np.maximum(neighbourhood * ENERGY_FLOOR, 1e-12), 0.0, 1.0
+    )
+
+    # The major eigenvector points along the gradient; a quarter turn gives the tangent.
+    angle = 0.5 * np.arctan2(2.0 * xy, difference)
+    tangent = np.stack([-np.sin(angle), np.cos(angle)], axis=-1)
+
+    fallback = np.array(
+        [np.cos(np.radians(FALLBACK_ANGLE)), np.sin(np.radians(FALLBACK_ANGLE))]
+    )
+
+    # A tangent has no inherent sign, so point them all the same way. This alone stops
+    # neighbouring strokes running head-on into each other.
+    facing = np.sign(tangent @ fallback)
+    tangent *= np.where(facing == 0, 1.0, facing)[..., np.newaxis]
+
+    trust = np.clip(
+        (coherence - COHERENCE_FLOOR) / (COHERENCE_CEILING - COHERENCE_FLOOR), 0.0, 1.0
+    )
+    trust = (trust * energy)[..., np.newaxis]
+    field = trust * tangent + (1.0 - trust) * fallback
+
+    length = np.linalg.norm(field, axis=-1, keepdims=True)
+    return field / np.maximum(length, 1e-9)
 
 
 def _plan_layer(
@@ -139,64 +267,92 @@ def _plan_layer(
     return list(zip(columns[inside].tolist(), rows[inside].tolist()))
 
 
-def _draw_layer(canvas, strokes, reference, radius, snap, generator, jitter) -> None:
-    """Trace and paint every stroke of one layer."""
+def _draw_layer(
+    canvas, height, strokes, reference, radius, snap, generator, jitter
+) -> None:
+    """Trace and paint every stroke of one layer, and record how thick the paint got."""
     brush = ImageDraw.Draw(canvas)
+    relief = ImageDraw.Draw(height)
 
-    # Strokes follow the image, so the direction to travel is worked out from the blurred
-    # reference rather than from the painting, which is full of hard stroke edges.
-    luminance = reference @ np.array([0.2126, 0.7152, 0.0722])
-    smoothed = gaussian_filter(luminance, sigma=max(1.0, radius / 2))
-    gradient_x = sobel(smoothed, axis=1)
-    gradient_y = sobel(smoothed, axis=0)
-
+    field = _orientation_field(reference, radius)
     reference_lab = xyz_to_lab(srgb_to_xyz(reference))
 
-    # One nudge per stroke, not per pixel: a brush is loaded once and then painted with.
-    # The jitter is applied in CIELAB and measured in colour difference, so the amount
-    # means the same thing whatever the colour -- an equal nudge to a dark red and a pale
-    # grey looks equally strong, which is not true of jittering the RGB values.
-    nudges = generator.normal(0.0, jitter, size=(len(strokes), 3)) if jitter else None
+    columns = np.array([x for x, _ in strokes])
+    rows = np.array([y for _, y in strokes])
+
+    # Every colour for the whole layer in one lookup rather than one per bristle. Each
+    # bristle is nudged separately, because a loaded brush does not carry one flat colour
+    # across its width either.
+    loaded = reference_lab[rows, columns]
+    nudged = np.repeat(loaded[:, np.newaxis, :], BRISTLES, axis=1)
+    if jitter:
+        nudged = nudged + generator.normal(0.0, jitter, size=nudged.shape)
+    colours = snap(nudged.reshape(-1, 3)).reshape(len(strokes), BRISTLES, 3)
+
+    # How thickly each stroke is loaded. Varying it is what gives the lit height field
+    # ridges between one stroke and the next.
+    thickness = generator.integers(90, 210, size=len(strokes))
+    widths = generator.uniform(*WIDTH_VARIATION, size=len(strokes))
 
     for index, (x, y) in enumerate(strokes):
-        loaded = reference_lab[y, x]
-        colour = snap(loaded if nudges is None else loaded + nudges[index])
-        # The stroke's path follows the photograph, not the nudged colour -- jitter is
-        # meant to vary the paint, not to send the brush somewhere else.
         points = _trace_stroke(
-            x, y, radius, gradient_x, gradient_y, reference_lab, loaded
+            x, y, radius, field, reference_lab, loaded[index]
         )
+        width = radius * widths[index]
+        tracks = _bristle_tracks(points, width)
+        paint_height = int(thickness[index])
 
-        if len(points) > 1:
-            brush.line(points, fill=colour, width=2 * radius, joint="curve")
+        if not tracks:
+            # A stroke with nowhere to go is a dab, which is a legitimate mark.
+            box = [x - width, y - width, x + width, y + width]
+            brush.ellipse(box, fill=tuple(colours[index, 0].tolist()))
+            relief.ellipse(box, fill=paint_height)
+            continue
 
-        # Round caps, which a polyline alone does not give, and which are most of what
-        # makes a mark read as a brush stroke rather than a ruled band.
-        for cap_x, cap_y in (points[0], points[-1]):
-            brush.ellipse(
-                [cap_x - radius, cap_y - radius, cap_x + radius, cap_y + radius],
-                fill=colour,
-            )
+        for bristle, outline in enumerate(tracks):
+            brush.polygon(outline, fill=tuple(colours[index, bristle].tolist()))
+            relief.polygon(outline, fill=paint_height)
+
+
+def _apply_impasto(painting: Image.Image, height: Image.Image) -> Image.Image:
+    """Light the paint from the side, so its ridges show.
+
+    Oil paint is not a flat film -- it stands off the canvas, and every stroke has an
+    edge where it steps up from what is underneath. Those edges catch the light, and
+    seeing them is most of what tells the eye it is looking at paint rather than at a
+    picture of a colour.
+
+    The height field is the record of how thickly each stroke was laid. Shading it by its
+    own slope against a fixed light gives the highlight along one side of each ridge and
+    the shadow along the other, with no need to model anything three-dimensional.
+    """
+    surface = gaussian_filter(np.asarray(height, dtype=float) / 255.0, IMPASTO_BLUR)
+    slope_y, slope_x = np.gradient(surface)
+
+    light_x, light_y = LIGHT_FROM
+    shading = 1.0 + IMPASTO_STRENGTH * (slope_x * light_x + slope_y * light_y)
+    shading = np.clip(shading, 0.55, 1.5)[..., np.newaxis]
+
+    lit = np.asarray(painting, dtype=float) * shading
+    return Image.fromarray(np.clip(lit, 0, 255).astype(np.uint8))
 
 
 def _trace_stroke(
     x: int,
     y: int,
     radius: int,
-    gradient_x: np.ndarray,
-    gradient_y: np.ndarray,
+    field: np.ndarray,
     reference_lab: np.ndarray,
     started_from: np.ndarray,
-) -> list[tuple[int, int]]:
-    """Follow the image from a starting point, turning as the picture turns.
+) -> list[tuple[float, float]]:
+    """Follow the orientation field from a starting point.
 
-    A stroke travels perpendicular to the gradient -- the direction in which the image is
-    changing least -- so it runs along an edge instead of across it, which is what makes
-    strokes seem to describe a form. It stops when it reaches somewhere whose colour no
-    longer matches the colour the stroke is loaded with.
+    The stroke stops when it leaves the picture, or when it reaches somewhere whose
+    colour no longer matches the colour the brush is loaded with -- a stroke should stay
+    inside the form it began in.
     """
-    height, width = gradient_x.shape
-    points = [(x, y)]
+    height, width, _ = field.shape
+    points = [(float(x), float(y))]
     position = np.array([float(x), float(y)])
     last_direction = np.zeros(2)
 
@@ -210,44 +366,79 @@ def _trace_stroke(
             if drifted > STROKE_TOLERANCE:
                 break
 
-        gradient = np.array([gradient_x[row, column], gradient_y[row, column]])
-        magnitude = np.linalg.norm(gradient)
-        if magnitude < 1e-6:
-            break
-
-        # Perpendicular to the gradient, kept pointing the way we were already going so
-        # the stroke does not double back on itself.
-        direction = np.array([-gradient[1], gradient[0]]) / magnitude
+        direction = field[row, column]
         if direction @ last_direction < 0:
             direction = -direction
 
         if step > 0:
             direction = CURVATURE * direction + (1 - CURVATURE) * last_direction
             length = np.linalg.norm(direction)
-            if length < 1e-6:
+            if length < 1e-9:
                 break
             direction = direction / length
 
         position = position + radius * direction
         last_direction = direction
-        points.append((int(round(position[0])), int(round(position[1]))))
+        points.append((float(position[0]), float(position[1])))
 
     return points
 
 
+def _bristle_tracks(
+    points: list[tuple[float, float]], radius: float
+) -> list[list[tuple[float, float]]]:
+    """Turn a path into a few tapered parallel ribbons, one per bristle.
+
+    A constant-width band with a round cap is the shape a mouse makes, not a brush. Real
+    bristles leave separate tracks with gaps between them, and the mark narrows as the
+    brush lifts, so each track is built as a polygon whose width falls off along its
+    length.
+    """
+    path = np.array(points, dtype=float)
+    if len(path) < 2:
+        return []
+
+    # A direction at each point, averaged from the segments either side of it.
+    segments = np.diff(path, axis=0)
+    directions = np.zeros_like(path)
+    directions[:-1] += segments
+    directions[1:] += segments
+    lengths = np.linalg.norm(directions, axis=1, keepdims=True)
+    directions /= np.maximum(lengths, 1e-9)
+    normals = np.stack([-directions[:, 1], directions[:, 0]], axis=1)
+
+    along = np.linspace(0.0, 1.0, len(path))
+    taper = 1.0 - (1.0 - TAPER_TO) * along
+
+    offsets = (
+        np.linspace(-1.0, 1.0, BRISTLES) if BRISTLES > 1 else np.zeros(1)
+    ) * BRISTLE_SPREAD
+    half_width = (radius / BRISTLES) * 1.15 * taper
+
+    tracks = []
+    for offset in offsets:
+        centre = path + normals * (offset * radius)
+        left = centre + normals * half_width[:, np.newaxis]
+        right = centre - normals * half_width[:, np.newaxis]
+        outline = np.vstack([left, right[::-1]])
+        tracks.append([(float(px), float(py)) for px, py in outline])
+    return tracks
+
+
 def _palette_snapper(palette_colours: np.ndarray):
-    """A function from a CIELAB colour to the nearest mixture, as RGB bytes for drawing.
+    """Maps CIELAB colours to the nearest mixtures, as RGB bytes ready for drawing.
 
     Works in CIELAB throughout, because that is the space the strokes are chosen and
     jittered in, and converting back and forth per stroke would be both slower and
     slightly lossy.
     """
     tree = cKDTree(xyz_to_lab(srgb_to_xyz(palette_colours)))
-    as_bytes = np.clip(np.round(palette_colours * 255), 0, 255).astype(int)
+    as_bytes = np.clip(np.round(palette_colours * 255), 0, 255).astype(np.uint8)
 
-    def snap(lab: np.ndarray) -> tuple[int, int, int]:
-        _, index = tree.query(lab)
-        return tuple(as_bytes[index].tolist())
+    def snap(lab: np.ndarray) -> np.ndarray:
+        """Takes an (n, 3) array of CIELAB colours, returns (n, 3) of RGB bytes."""
+        _, indices = tree.query(np.atleast_2d(lab))
+        return as_bytes[indices]
 
     return snap
 
