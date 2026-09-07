@@ -45,6 +45,8 @@ Run it with:  python examples/zorn_painting.py <image> [output] [-m N] [--seed N
 from __future__ import annotations
 
 import argparse
+import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -113,6 +115,17 @@ IMPASTO_STRENGTH = 1.6
 IMPASTO_BLUR = 1.1
 LIGHT_FROM = (-0.7071, -0.7071)
 
+# Video of the painting being made.
+VIDEO_SECONDS = 15.0
+VIDEO_FPS = 30
+VIDEO_HOLD_SECONDS = 1.5
+
+# How the running time is shared between layers. Sharing it in proportion to the number of
+# strokes would hand almost the whole film to the last layer, which has forty times as many
+# strokes as the first and the least to show for them. A fractional power evens out how
+# much the picture visibly changes per second.
+FRAME_WEIGHT = 0.3
+
 # How far a stroke's colour may wander from the palette mixture it started with before it
 # is cut short, in units of colour difference.
 STROKE_TOLERANCE = 25.0
@@ -130,6 +143,7 @@ def paint(
     radii: list[int] | None = None,
     seed: int = 0,
     jitter: float = COLOUR_JITTER,
+    recorder: "Recorder | None" = None,
 ) -> Image.Image:
     """Work from the coarsest brush to the finest, refining what the last one missed."""
     radii = BRUSH_RADII if radii is None else radii
@@ -147,19 +161,96 @@ def paint(
     # what paint does.
     relief = Image.new("L", (width, height), 128)
 
+    # The layers have to be planned before any are painted, so the film's running time
+    # can be shared out between them.
+    planned = []
+    scratch = canvas.copy()
     for radius in radii:
         reference = gaussian_filter(
             image, sigma=(BLUR_PER_RADIUS * radius, BLUR_PER_RADIUS * radius, 0)
         )
-        strokes = _plan_layer(np.asarray(canvas) / 255.0, reference, radius)
+        strokes = _plan_layer(np.asarray(scratch) / 255.0, reference, radius)
         generator.shuffle(strokes)
+        planned.append((radius, reference, strokes))
+        # A rough stand-in for what the layer will do, good enough to plan the next one.
+        scratch = _preview_layer(scratch, reference, strokes, radius)
 
+    budget = (
+        _plan_frames(
+            [len(strokes) for _, _, strokes in planned],
+            round((VIDEO_SECONDS - VIDEO_HOLD_SECONDS) * VIDEO_FPS),
+        )
+        if recorder
+        else [0] * len(planned)
+    )
+
+    if recorder:
+        recorder.frame(canvas, relief)
+
+    for (radius, reference, strokes), frames in zip(planned, budget):
         _draw_layer(
-            canvas, relief, strokes, reference, radius, snap, generator, jitter
+            canvas, relief, strokes, reference, radius, snap, generator, jitter,
+            recorder, frames,
         )
         print(f"    brush {radius:3d}px  {len(strokes):6d} strokes")
 
+    if recorder:
+        recorder.frame(canvas, relief, times=round(VIDEO_HOLD_SECONDS * VIDEO_FPS))
+
     return _apply_impasto(canvas, relief)
+
+
+class Recorder:
+    """Pipes frames of the painting-in-progress straight into ffmpeg.
+
+    Frames are handed over as raw pixels rather than encoded images, so nothing touches
+    the disk until ffmpeg writes the finished file.
+    """
+
+    def __init__(self, path: Path, size: tuple[int, int], fps: int = VIDEO_FPS) -> None:
+        width, height = size
+        self.size = size
+        # H.264 in the widely-playable pixel format needs even dimensions, and an odd
+        # image would otherwise fail deep inside ffmpeg with nothing useful said about it.
+        self.process = subprocess.Popen(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}", "-r", str(fps),
+                "-i", "-",
+                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                "-pix_fmt", "yuv420p",
+                str(path),
+            ],
+            stdin=subprocess.PIPE,
+        )
+        self.count = 0
+
+    def frame(self, painting: Image.Image, relief: Image.Image, times: int = 1) -> None:
+        """Record the painting as it currently stands, lit as the finished one will be."""
+        pixels = _apply_impasto(painting, relief).tobytes()
+        for _ in range(times):
+            self.process.stdin.write(pixels)
+            self.count += 1
+
+    def close(self) -> None:
+        self.process.stdin.close()
+        self.process.wait()
+
+
+def _plan_frames(counts: list[int], total: int) -> list[int]:
+    """Share the film's running time between the layers.
+
+    Not in proportion to the number of strokes, which would give the whole film to the
+    last layer -- there are forty times as many strokes in it as in the first, and the
+    least to show for them, since by then the picture is only being refined. Weighting by
+    a fractional power leaves the fine work dominant while keeping the blocking-in long
+    enough to watch, which is the part worth seeing.
+    """
+    weights = [count ** FRAME_WEIGHT for count in counts]
+    scale = total / max(sum(weights), 1e-9)
+    return [max(1, round(weight * scale)) for weight in weights]
 
 
 def _orientation_field(reference: np.ndarray, radius: int) -> np.ndarray:
@@ -267,8 +358,27 @@ def _plan_layer(
     return list(zip(columns[inside].tolist(), rows[inside].tolist()))
 
 
+def _preview_layer(canvas, reference, strokes, radius):
+    """Roughly what a layer will leave behind, for planning the next one.
+
+    Painting a layer twice would double the running time, so this stands in: the strokes
+    are known, and a blurred reference painted through discs of the right size is close
+    enough to decide where the *next* brush will be needed.
+    """
+    preview = canvas.copy()
+    stamp = ImageDraw.Draw(preview)
+    colours = np.clip(np.round(reference * 255), 0, 255).astype(np.uint8)
+    for x, y in strokes:
+        stamp.ellipse(
+            [x - radius, y - radius, x + radius, y + radius],
+            fill=tuple(colours[y, x].tolist()),
+        )
+    return preview
+
+
 def _draw_layer(
-    canvas, height, strokes, reference, radius, snap, generator, jitter
+    canvas, height, strokes, reference, radius, snap, generator, jitter,
+    recorder=None, frames=0,
 ) -> None:
     """Trace and paint every stroke of one layer, and record how thick the paint got."""
     brush = ImageDraw.Draw(canvas)
@@ -294,6 +404,8 @@ def _draw_layer(
     thickness = generator.integers(90, 210, size=len(strokes))
     widths = generator.uniform(*WIDTH_VARIATION, size=len(strokes))
 
+    capture_every = max(1, len(strokes) // frames) if recorder and frames else 0
+
     for index, (x, y) in enumerate(strokes):
         points = _trace_stroke(
             x, y, radius, field, reference_lab, loaded[index]
@@ -307,11 +419,16 @@ def _draw_layer(
             box = [x - width, y - width, x + width, y + width]
             brush.ellipse(box, fill=tuple(colours[index, 0].tolist()))
             relief.ellipse(box, fill=paint_height)
+            if capture_every and index % capture_every == 0:
+                recorder.frame(canvas, height)
             continue
 
         for bristle, outline in enumerate(tracks):
             brush.polygon(outline, fill=tuple(colours[index, bristle].tolist()))
             relief.polygon(outline, fill=paint_height)
+
+        if capture_every and index % capture_every == 0:
+            recorder.frame(canvas, height)
 
 
 def _apply_impasto(painting: Image.Image, height: Image.Image) -> Image.Image:
@@ -451,6 +568,7 @@ def main(
     longest_side: int = 1400,
     radii: list[int] | None = None,
     jitter: float = COLOUR_JITTER,
+    video: str | None = None,
 ) -> None:
     source_path = Path(source)
     destination_path = (
@@ -477,8 +595,23 @@ def main(
         palette_colours = palette_colours[keep]
         print(f"  restricted to {len(keep)} mixtures")
 
-    painting = paint(image, palette_colours, radii=radii, seed=seed, jitter=jitter)
+    recorder = None
+    if video is not None:
+        if shutil.which("ffmpeg") is None:
+            raise SystemExit("ffmpeg is needed to record the painting, and is not on PATH")
+        video_path = Path(video)
+        recorder = Recorder(video_path, (image.shape[1], image.shape[0]))
+        print(f"  recording {VIDEO_SECONDS:.0f}s at {VIDEO_FPS}fps to {video_path}")
+
+    painting = paint(
+        image, palette_colours, radii=radii, seed=seed, jitter=jitter, recorder=recorder
+    )
     painting.save(destination_path)
+
+    if recorder is not None:
+        recorder.close()
+        print(f"  wrote {video_path} ({recorder.count / VIDEO_FPS:.1f}s, "
+              f"{recorder.count} frames)")
 
     difference = np.linalg.norm(
         xyz_to_lab(srgb_to_xyz(image))
@@ -518,6 +651,12 @@ if __name__ == "__main__":
         "mixture (default %(default)s, 0 to disable)",
     )
     parser.add_argument(
+        "--video",
+        metavar="FILE.mp4",
+        help=f"also record the painting being made, about {VIDEO_SECONDS:.0f} seconds long "
+        "(needs ffmpeg)",
+    )
+    parser.add_argument(
         "--longest-side",
         type=int,
         default=1400,
@@ -532,4 +671,5 @@ if __name__ == "__main__":
         arguments.longest_side,
         [int(radius) for radius in arguments.brushes.split(",")],
         arguments.jitter,
+        arguments.video,
     )
