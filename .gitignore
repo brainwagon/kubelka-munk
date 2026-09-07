@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 zorn_wheel.svg
 *_zorn*.png
+*_painting*.png
